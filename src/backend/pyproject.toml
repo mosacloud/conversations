@@ -47,6 +47,9 @@ dependencies = [
     "lxml==6.1.1",
     "markdown==3.10.2",
     "markitdown==0.0.2",
+    # Direct pin to patch CVE-2026-59950 (transitive via pydantic-ai-slim[mcp]).
+    # Drop on the next upstream rebase once conversations ships mcp>=1.28.1.
+    "mcp>=1.28.1",
     "mozilla-django-oidc==4.0.1",
     "nested-multipart-parser==1.6.0",
     "posthog==7.18.0",
