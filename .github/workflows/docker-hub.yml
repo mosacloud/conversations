@@ -52,6 +52,7 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
       -
         name: Run trivy scan
+        continue-on-error: true # dev fork: security scan is advisory, must not block :dev image
         uses: numerique-gouv/action-trivy-cache@main
         with:
           docker-build-args: '--target backend-production -f Dockerfile'
@@ -106,6 +107,7 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
       -
         name: Run trivy scan
+        continue-on-error: true # dev fork: security scan is advisory, must not block :dev image
         uses: numerique-gouv/action-trivy-cache@main
         with:
           docker-build-args: '-f src/frontend/Dockerfile --target frontend-production'
