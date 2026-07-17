@@ -50,7 +50,10 @@ export const LaGaufre = () => {
       `}
     >
       <LaGaufreV2Fixed
-        {...waffleConfig}
+        // waffleConfig comes from backend config (apiUrl and data both optional);
+        // the guard above ensures exactly one is set, which the WaffleType xor-union
+        // can't infer, so cast through.
+        {...(waffleConfig as unknown as WaffleType)}
         label={waffleConfig.label ?? t('Mosa services')}
         newWindowLabelSuffix={` (${t('new window')})`}
       />
