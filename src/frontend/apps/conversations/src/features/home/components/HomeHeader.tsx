@@ -1,6 +1,6 @@
 import { useTranslation } from 'react-i18next';
 
-import Logo from '@/assets/logo/logo-assistant.svg?react';
+import Logo from '@/assets/logo/logo-ai.svg?react';
 import { Box } from '@/components';
 import { productName } from '@/core';
 import { useCunninghamTheme } from '@/cunningham';

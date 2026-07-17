@@ -1,0 +1,106 @@
+{
+  "translations": {
+    "en": {
+      "translation": {
+        "Assistant": "ai"
+      }
+    }
+  },
+  "footer": {
+    "default": {
+      "logo": {
+        "src": "/assets/icon-assistant.svg",
+        "width": "54px",
+        "alt": "Mosa ai",
+        "withTitle": true
+      },
+      "externalLinks": [
+        {
+          "label": "mosa.cloud",
+          "href": "https://mosa.cloud/"
+        },
+        {
+          "label": "GitHub",
+          "href": "https://github.com/mosacloud/conversations/"
+        }
+      ],
+      "bottomInformation": {
+        "label": "Unless otherwise stated, all content on this site is under",
+        "link": {
+          "label": "licence MIT",
+          "href": "https://github.com/mosacloud/conversations/blob/main/LICENSE"
+        }
+      }
+    },
+    "en": {
+      "legalLinks": [
+        { "label": "Legal Notice", "href": "#" },
+        { "label": "Personal data and cookies", "href": "#" }
+      ]
+    }
+  },
+  "header": {
+    "logo": {},
+    "icon": {
+      "src": "/assets/icon-assistant.svg",
+      "style": { "width": "32px", "height": "auto" },
+      "alt": "ai",
+      "withTitle": true
+    }
+  },
+  "waffle": {
+    "data": {
+      "services": [
+        {
+          "name": "ai",
+          "url": "https://ai.dev.mosacloud.dev/",
+          "maturity": "beta",
+          "logo": "https://ai.dev.mosacloud.dev/assets/icon-assistant.svg"
+        },
+        {
+          "name": "Docs",
+          "url": "https://docs.mosacloud.eu/",
+          "maturity": "stable",
+          "logo": "https://docs.mosacloud.eu/assets/icon-docs.svg"
+        },
+        {
+          "name": "Drive",
+          "url": "https://drive.mosacloud.eu/",
+          "maturity": "stable",
+          "logo": "https://drive.mosacloud.eu/assets/icon-drive.svg"
+        },
+        {
+          "name": "Meet",
+          "url": "https://meet.mosacloud.eu/",
+          "maturity": "stable",
+          "logo": "https://meet.mosacloud.eu/assets/icon-meet.svg"
+        },
+        {
+          "name": "Mail",
+          "url": "https://mail.mosacloud.eu/",
+          "maturity": "stable",
+          "logo": "https://mail.mosacloud.eu/assets/icon-mail.svg"
+        },
+        {
+          "name": "Calendar",
+          "url": "https://calendar.mosacloud.eu/",
+          "maturity": "stable",
+          "logo": "https://calendar.mosacloud.eu/assets/icon-calendar.svg"
+        }
+      ]
+    },
+    "showMoreLimit": 9
+  },
+  "home": {
+    "with-proconnect": false,
+    "icon-banner": {
+      "src": "/assets/icon-assistant.svg",
+      "style": { "width": "64px", "height": "auto" },
+      "alt": ""
+    }
+  },
+  "favicon": {
+    "light": { "href": "/assets/favicon-light.png", "type": "image/png" },
+    "dark": { "href": "/assets/favicon-dark.png", "type": "image/png" }
+  }
+}

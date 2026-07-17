@@ -1,0 +1,21 @@
+<svg width="96" height="40" viewBox="0 0 96 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="ai-grad" x1="0" y1="8" x2="0" y2="34" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6D8BFF"/>
+      <stop offset="1" stop-color="#0443F2"/>
+    </linearGradient>
+  </defs>
+  <!-- Wordmark "ai" — edit letterforms as needed -->
+  <text x="0" y="31"
+        font-family="'Hanken Grotesk', Inter, sans-serif"
+        font-size="34" font-weight="800" letter-spacing="-1"
+        fill="url(#ai-grad)">ai</text>
+  <!-- beta pill -->
+  <g>
+    <rect x="46" y="13" width="44" height="16" rx="8" fill="#EEF1FA"/>
+    <text x="68" y="25" text-anchor="middle"
+          font-family="'Hanken Grotesk', Inter, sans-serif"
+          font-size="10" font-weight="700" letter-spacing="0.5"
+          fill="#0443F2">beta</text>
+  </g>
+</svg>
