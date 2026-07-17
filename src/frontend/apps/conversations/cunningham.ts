@@ -145,8 +145,9 @@ export const commonGlobals = {
 
 export const whiteLabelGlobals = {
   colors: {
-    'logo-1': '#4844AD',
-    'logo-2': '#4844AD',
+    // Mosa "ai" family gradient: periwinkle -> Mosa brand blue.
+    'logo-1': '#0443F2',
+    'logo-2': '#6D8BFF',
     'brand-050': '#EEF1FA',
     'brand-100': '#DDE2F5',
     'brand-150': '#CED3F1',
@@ -478,6 +479,11 @@ export const whiteLabelGlobals = {
     'white-975': '#F8F8F9F9',
   },
   ...commonGlobals,
+  components: {
+    ...commonGlobals.components,
+    // Mosa app switcher on by default in the white-label (Mosa) theme.
+    'la-gaufre': true,
+  },
   font: {
     ...commonGlobals.font,
     families: {

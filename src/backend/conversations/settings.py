@@ -492,7 +492,7 @@ class Base(BraveSettings, Configuration):
     SOLO_CACHE_TIMEOUT = 60 * 5
     SOLO_CACHE_PREFIX = "solo"
     THEME_CUSTOMIZATION_FILE_PATH = values.Value(
-        os.path.join(BASE_DIR, "conversations/configuration/theme/default.json"),
+        os.path.join(BASE_DIR, "conversations/configuration/theme/mosa.json"),
         environ_name="THEME_CUSTOMIZATION_FILE_PATH",
         environ_prefix=None,
     )

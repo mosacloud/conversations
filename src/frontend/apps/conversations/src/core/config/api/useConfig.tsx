@@ -6,9 +6,25 @@ import { BaseTheme } from '@/cunningham/';
 import { FooterType } from '@/features/footer';
 import { PostHogConf } from '@/services';
 
+interface WaffleService {
+  name: string;
+  url: string;
+  logo?: string;
+  maturity?: string;
+}
+
+interface WaffleCustomization {
+  apiUrl?: string;
+  data?: { services: WaffleService[] };
+  label?: string;
+  showMoreLimit?: number;
+  widgetPath?: string;
+}
+
 interface ThemeCustomization {
   footer?: FooterType;
   translations?: Resource;
+  waffle?: WaffleCustomization;
 }
 
 export enum FeatureFlagState {

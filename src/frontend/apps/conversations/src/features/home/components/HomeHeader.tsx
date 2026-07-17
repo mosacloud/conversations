@@ -1,7 +1,7 @@
 import Image from 'next/image';
 import { useTranslation } from 'react-i18next';
 
-import Logo from '@/assets/logo/logo-assistant.svg';
+import Logo from '@/assets/logo/logo-ai.svg';
 import { Box } from '@/components';
 import { productName } from '@/core';
 import { useCunninghamTheme } from '@/cunningham';
