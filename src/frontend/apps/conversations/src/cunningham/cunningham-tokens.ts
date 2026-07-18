@@ -336,8 +336,8 @@ export const tokens = {
           'white-900': '#F8F8F9E5',
           'white-950': '#F8F8F9F2',
           'white-975': '#F8F8F9F9',
-          'logo-1': '#4844AD',
-          'logo-2': '#4844AD',
+          'logo-1': '#0443F2',
+          'logo-2': '#6D8BFF',
         },
         transitions: {
           'ease-in': 'cubic-bezier(0.32, 0, 0.67, 0)',
@@ -425,7 +425,7 @@ export const tokens = {
           tablet: '1024px',
         },
         components: {
-          'la-gaufre': false,
+          'la-gaufre': true,
           'home-proconnect': false,
           logo: { src: '', alt: '', widthHeader: '', widthFooter: '' },
         },
@@ -1016,8 +1016,8 @@ export const tokens = {
           'white-900': '#F8F8F9E5',
           'white-950': '#F8F8F9F2',
           'white-975': '#F8F8F9F9',
-          'logo-1': '#4844AD',
-          'logo-2': '#4844AD',
+          'logo-1': '#0443F2',
+          'logo-2': '#6D8BFF',
         },
         transitions: {
           'ease-in': 'cubic-bezier(0.32, 0, 0.67, 0)',
@@ -1105,7 +1105,7 @@ export const tokens = {
           tablet: '1024px',
         },
         components: {
-          'la-gaufre': false,
+          'la-gaufre': true,
           'home-proconnect': false,
           logo: { src: '', alt: '', widthHeader: '', widthFooter: '' },
         },
