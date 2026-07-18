@@ -77,6 +77,18 @@ class Base(BraveSettings, Configuration):
     SECRET_KEY = values.Value(None)
     SERVER_TO_SERVER_API_TOKENS = values.ListValue([])
 
+    # MCP (Model Context Protocol) servers attached to the chat agent as toolsets.
+    # Configuration-driven (no hardcoded servers): provide either an inline JSON string
+    # in MCP_SERVERS_CONFIGURATION or a path to a JSON file (e.g. a mounted ConfigMap) in
+    # MCP_SERVERS_CONFIGURATION_FILE_PATH. See chat/mcp_servers.py for the shape. Secrets
+    # in headers use ${ENV_VAR} placeholders resolved at load time.
+    MCP_SERVERS_CONFIGURATION = values.Value(
+        None, environ_name="MCP_SERVERS_CONFIGURATION", environ_prefix=None
+    )
+    MCP_SERVERS_CONFIGURATION_FILE_PATH = values.Value(
+        None, environ_name="MCP_SERVERS_CONFIGURATION_FILE_PATH", environ_prefix=None
+    )
+
     # Application definition
     ROOT_URLCONF = "conversations.urls"
     WSGI_APPLICATION = "conversations.wsgi.application"
