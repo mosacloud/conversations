@@ -1,20 +1,118 @@
-"""MCP servers configuration: will be replaced by models."""
+"""MCP servers configuration.
 
+MCP (Model Context Protocol) servers are attached to the chat agent as toolsets
+(see ``chat.clients.pydantic_ai``), giving the agent access to external tools and
+data sources — knowledge-base search, document stores, etc. — through a single
+open standard.
+
+The set of servers is configuration, not code: it is read from settings
+(``MCP_SERVERS_CONFIGURATION`` inline JSON, or ``MCP_SERVERS_CONFIGURATION_FILE_PATH``
+pointing at a JSON file, e.g. a mounted ConfigMap). Secrets in headers are kept out
+of the configuration document by referencing environment variables with
+``${ENV_VAR}`` placeholders, resolved at load time.
+
+Configuration shape (mirrors the common ``mcpServers`` convention)::
+
+    {
+      "mcpServers": {
+        "my-kb": {
+          "url": "https://example.org/mcp",
+          "transport": "sse",                 # "streamable-http" (default) | "sse"
+          "headers": {"Authorization": "Bearer ${MY_MCP_API_KEY}"},
+          "tool_prefix": "kb"                  # optional, namespaces the server's tools
+        }
+      }
+    }
+"""
+
+import json
+import logging
+import os
+import re
+
+from django.conf import settings
+
+from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 from pydantic_ai.mcp import MCPToolset
 
-MCP_SERVERS = {
-    "mcpServers": {
-        # "github": {
-        #     "url": "https://api.githubcopilot.com/mcp/",
-        #     "headers": {"Authorization": "Bearer XXX"},
-        # },
-    }
+logger = logging.getLogger(__name__)
+
+_ENV_PLACEHOLDER = re.compile(r"\$\{(\w+)\}")
+
+_TRANSPORTS = {
+    "streamable-http": StreamableHttpTransport,
+    "http": StreamableHttpTransport,
+    "sse": SSETransport,
 }
 
 
+def _resolve_env(value):
+    """Replace ``${ENV_VAR}`` placeholders in a string with the environment value.
+
+    Keeps API keys and other secrets out of the (potentially committed / ConfigMap)
+    configuration document. Unknown variables resolve to an empty string.
+    """
+    if not isinstance(value, str):
+        return value
+    return _ENV_PLACEHOLDER.sub(lambda m: os.environ.get(m.group(1), ""), value)
+
+
+def load_mcp_servers_configuration() -> dict:
+    """Load the raw MCP servers configuration from settings.
+
+    ``MCP_SERVERS_CONFIGURATION_FILE_PATH`` (a JSON file) takes precedence over the
+    inline ``MCP_SERVERS_CONFIGURATION`` JSON string. Returns an empty configuration
+    when neither is set, so no servers are attached by default.
+    """
+    file_path = getattr(settings, "MCP_SERVERS_CONFIGURATION_FILE_PATH", None)
+    raw = getattr(settings, "MCP_SERVERS_CONFIGURATION", None)
+
+    if file_path:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+
+    if not raw:
+        return {"mcpServers": {}}
+
+    if isinstance(raw, (dict, list)):
+        return raw
+
+    return json.loads(raw)
+
+
 def get_mcp_servers():
-    """Retrieve MCP servers configuration."""
-    return [
-        MCPToolset(server_config["url"], headers=server_config.get("headers"))
-        for _name, server_config in MCP_SERVERS["mcpServers"].items()
-    ]
+    """Build the list of pydantic-ai MCP toolsets from configuration.
+
+    The ``transport`` key selects the fastmcp transport explicitly (rather than
+    letting fastmcp infer it from the URL shape), so ``"sse"`` works for URLs
+    that don't end in ``/sse``.
+    """
+    configuration = load_mcp_servers_configuration()
+
+    servers = []
+    for name, server_config in configuration.get("mcpServers", {}).items():
+        config = dict(server_config)
+        transport_name = config.pop("transport", "streamable-http")
+        transport_class = _TRANSPORTS.get(transport_name)
+        if transport_class is None:
+            raise ValueError(
+                f"MCP server '{name}': unsupported transport '{transport_name}'. "
+                f"Expected one of {sorted(_TRANSPORTS)}."
+            )
+
+        headers = config.pop("headers", None)
+        if headers:
+            headers = {key: _resolve_env(val) for key, val in headers.items()}
+
+        url = _resolve_env(config.pop("url"))
+        tool_prefix = config.pop("tool_prefix", None)
+
+        toolset = MCPToolset(
+            transport_class(url=url, headers=headers), id=name, **config
+        )
+        if tool_prefix:
+            toolset = toolset.prefixed(tool_prefix)
+
+        servers.append(toolset)
+
+    return servers
