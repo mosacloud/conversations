@@ -1054,6 +1054,60 @@ USER QUESTION:
         environ_prefix=None,
     )
 
+    # ScaiMatrix (ScaiGrid sovereign knowledge platform) RAG backend
+    SCAIMATRIX_API_URL = values.Value(
+        "https://scaigrid.scailabs.ai",
+        environ_name="SCAIMATRIX_API_URL",
+        environ_prefix=None,
+    )
+    SCAIMATRIX_API_KEY = values.Value(
+        None,  # reuse the ScaiGrid key, e.g. SCAIMATRIX_API_KEY=${SCAIGRID_API_KEY}
+        environ_name="SCAIMATRIX_API_KEY",
+        environ_prefix=None,
+    )
+    SCAIMATRIX_API_TIMEOUT = values.PositiveIntegerValue(
+        default=30,  # seconds
+        environ_name="SCAIMATRIX_API_TIMEOUT",
+        environ_prefix=None,
+    )
+    SCAIMATRIX_EMBEDDING_MODEL = values.Value(
+        "mistralai/mistral-embed",  # sovereign default; any ScaiGrid embedding model works
+        environ_name="SCAIMATRIX_EMBEDDING_MODEL",
+        environ_prefix=None,
+    )
+    SCAIMATRIX_CHUNKING_STRATEGY = values.Value(
+        "semantic",  # fixed | semantic | markdown | code
+        environ_name="SCAIMATRIX_CHUNKING_STRATEGY",
+        environ_prefix=None,
+    )
+    SCAIMATRIX_CHUNK_SIZE = values.PositiveIntegerValue(
+        default=800,
+        environ_name="SCAIMATRIX_CHUNK_SIZE",
+        environ_prefix=None,
+    )
+    SCAIMATRIX_CHUNK_OVERLAP = values.PositiveIntegerValue(
+        default=100,
+        environ_name="SCAIMATRIX_CHUNK_OVERLAP",
+        environ_prefix=None,
+    )
+    SCAIMATRIX_SEARCH_TYPE = values.Value(
+        "vector",  # vector | hybrid | graph
+        environ_name="SCAIMATRIX_SEARCH_TYPE",
+        environ_prefix=None,
+    )
+    # Ingestion is async (pending -> ... -> indexed); store_document polls up to
+    # this budget, checking every interval, before giving up.
+    SCAIMATRIX_INDEX_POLL_TIMEOUT = values.PositiveIntegerValue(
+        default=120,  # seconds
+        environ_name="SCAIMATRIX_INDEX_POLL_TIMEOUT",
+        environ_prefix=None,
+    )
+    SCAIMATRIX_INDEX_POLL_INTERVAL = values.PositiveIntegerValue(
+        default=2,  # seconds
+        environ_name="SCAIMATRIX_INDEX_POLL_INTERVAL",
+        environ_prefix=None,
+    )
+
     # Logging
     # We want to make it easy to log to console but by default we log production
     # to Sentry and don't want to log to console.
@@ -1262,6 +1316,17 @@ USER QUESTION:
             raise ValueError(
                 f"{cls.RAG_DOCUMENT_SEARCH_BACKEND} requires FIND_API_KEY, FIND_API_URL, "
                 "OIDC_STORE_ACCESS_TOKEN and OIDC_STORE_REFRESH_TOKEN to be set."
+            )
+
+        # ScaiMatrix configuration
+        if (
+            cls.RAG_DOCUMENT_SEARCH_BACKEND
+            == "chat.agent_rag.document_rag_backends.scaimatrix_rag_backend.ScaiMatrixRagBackend"
+            and not all((cls.SCAIMATRIX_API_URL, cls.SCAIMATRIX_API_KEY))
+        ):
+            raise ValueError(
+                f"{cls.RAG_DOCUMENT_SEARCH_BACKEND} requires SCAIMATRIX_API_URL and "
+                "SCAIMATRIX_API_KEY to be set."
             )
 
         # Document context budget ratio must be a fraction (0 disables full inlining,
