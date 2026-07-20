@@ -43,6 +43,7 @@ jobs:
             type=raw,value=${{ steps.version.outputs.version }}-mosa.${{ github.run_number }},enable={{is_default_branch}}
             type=raw,value=${{ steps.version.outputs.version }}-mosa.${{ github.run_number }}.cvepatch,enable={{is_default_branch}}
             type=ref,event=pr
+            type=ref,event=branch
             type=semver,pattern={{version}}
       -
         name: Login to DockerHub
@@ -99,6 +100,7 @@ jobs:
             type=raw,value=${{ steps.version.outputs.version }}-mosa.${{ github.run_number }},enable={{is_default_branch}}
             type=raw,value=${{ steps.version.outputs.version }}-mosa.${{ github.run_number }}.cvepatch,enable={{is_default_branch}}
             type=ref,event=pr
+            type=ref,event=branch
             type=semver,pattern={{version}}
       -
         name: Login to DockerHub
