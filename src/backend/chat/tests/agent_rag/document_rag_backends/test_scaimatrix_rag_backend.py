@@ -99,6 +99,35 @@ def test_store_document_uploads_and_polls_until_indexed(settings_scaimatrix):
 
 
 @responses.activate
+def test_parse_and_store_uploads_raw_file_and_returns_empty_parsed(settings_scaimatrix):
+    """Raw bytes go straight to ScaiMatrix (native parse); parsed_content is empty."""
+    backend = ScaiMatrixRagBackend(collection_id="col-1")
+    docs_url = f"{COLLECTIONS_URL}/col-1/documents"
+
+    responses.post(docs_url, json=_envelope({"id": "doc-7", "status": "pending"}), status=201)
+    responses.get(f"{docs_url}/doc-7", json=_envelope({"status": "indexed"}), status=200)
+
+    parsed, document_id = backend.parse_and_store_document(
+        name="sla.pdf", content_type="application/pdf", content=b"%PDF-1.4 ..."
+    )
+
+    assert parsed == ""
+    assert document_id == "doc-7"
+    body = responses.calls[0].request.body
+    body = body.decode("utf-8", "ignore") if isinstance(body, bytes) else body
+    # the original filename is used, not a .md-wrapped name
+    assert "sla.pdf" in body
+    assert "sla.pdf.md" not in body
+
+
+@responses.activate
+def test_parse_and_store_without_collection_raises(settings_scaimatrix):
+    backend = ScaiMatrixRagBackend()
+    with pytest.raises(RuntimeError, match="collection_id"):
+        backend.parse_and_store_document(name="x", content_type="text/plain", content=b"x")
+
+
+@responses.activate
 def test_store_document_raises_on_terminal_error(settings_scaimatrix):
     backend = ScaiMatrixRagBackend(collection_id="col-1")
     docs_url = f"{COLLECTIONS_URL}/col-1/documents"

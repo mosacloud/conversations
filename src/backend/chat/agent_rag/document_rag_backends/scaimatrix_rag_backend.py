@@ -176,29 +176,57 @@ class ScaiMatrixRagBackend(BaseRagBackend):
 
     # -- ingestion -----------------------------------------------------------
 
-    def store_document(self, name: str, content: str, **kwargs) -> Optional[str]:
-        """Upload markdown content and block until it is indexed.
+    def parse_and_store_document(
+        self, name: str, content_type: str, content: bytes, **kwargs
+    ) -> tuple[str, Optional[str]]:
+        """Upload the original file to ScaiMatrix, which parses it natively.
 
-        Returns the ScaiMatrix document id, later used to scope search to a
-        single document and as the target of :meth:`delete_document`.
+        Overrides the base (parse-to-markdown then store) flow: ScaiMatrix
+        ingests PDF/Word/HTML/etc. with the right chunking per type, so we hand
+        it the raw bytes instead of routing them through a local/Albert parser.
+
+        The returned ``parsed_content`` is empty: ScaiMatrix does not return the
+        parsed markdown, and RAG search reads from its own chunks. The markdown
+        companion (used for inlining/summarizing binary files) is therefore
+        empty for this backend — a known limitation, not a failure.
         """
+        if not self.collection_id:
+            raise RuntimeError("The RAG backend requires collection_id")
+
+        document_id = self._upload_file(name, content, content_type or "application/octet-stream")
+        self._wait_until_indexed(document_id)
+        return "", document_id
+
+    def store_document(self, name: str, content: str, **kwargs) -> Optional[str]:
+        """Store already-parsed markdown content and block until indexed.
+
+        Retained for callers that pass markdown text directly (the raw-file
+        path is :meth:`parse_and_store_document`). Returns the ScaiMatrix
+        document id used to scope search and to target :meth:`delete_document`.
+        """
+        document_id = self._upload_file(
+            f"{name}.md", content.encode("utf-8"), "text/markdown"
+        )
+        self._wait_until_indexed(document_id)
+        return document_id
+
+    def _upload_file(self, filename: str, content: bytes, content_type: str) -> str:
+        """POST a file to the collection's documents endpoint, returning its id."""
         response = requests.post(
             self._documents_url(self.collection_id),
             headers=self._headers,
             files={
-                "file": (f"{name}.md", BytesIO(content.encode("utf-8")), "text/markdown"),
+                "file": (filename, BytesIO(content), content_type),
             },
             data={
-                "name": name,
-                "metadata": json.dumps({"document_name": name}),
+                "name": filename,
+                "metadata": json.dumps({"document_name": filename}),
             },
             timeout=settings.SCAIMATRIX_API_TIMEOUT,
         )
         logger.debug(response.text)
         response.raise_for_status()
-        document_id = self._document_id(self._data(response))
-        self._wait_until_indexed(document_id)
-        return document_id
+        return self._document_id(self._data(response))
 
     async def astore_document(self, name: str, content: str, **kwargs) -> Optional[str]:
         """Async variant of :meth:`store_document`."""
