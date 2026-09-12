@@ -18,7 +18,8 @@
         "JlXRUC/HwTscPIXf/iklq/tjb/gHAdxkCUjAg2QAAAABJRU5ErkJggg=="
       ],
       "system_prompt": "settings.AI_AGENT_INSTRUCTIONS",
-      "tools": "settings.AI_AGENT_TOOLS"
+      "tools": "settings.AI_AGENT_TOOLS",
+      "web_search": "settings.AI_WEB_SEARCH"
     },
     {
       "hrid": "default-summarization-model",

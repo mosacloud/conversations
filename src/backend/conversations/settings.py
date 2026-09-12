@@ -34,6 +34,7 @@ from core.file_upload.enums import FileToLLMMode, FileUploadMode
 from chat import prompts
 from chat.llm_configuration import cached_load_llm_configuration, load_llm_configuration
 from conversations.brave_settings import BraveSettings
+from conversations.staan_settings import StaanSettings
 from conversations.celery_settings import CelerySettings
 from conversations.observability_settings import ObservabilitySettings
 from conversations.oidc_settings import OIDCSettings
@@ -57,6 +58,7 @@ def get_release():
 
 class Base(
     BraveSettings,
+    StaanSettings,
     CelerySettings,
     ObservabilitySettings,
     OIDCSettings,
@@ -611,6 +613,11 @@ class Base(
     AI_API_KEY = values.Value(None, environ_name="AI_API_KEY", environ_prefix=None)
     AI_BASE_URL = values.Value(None, environ_name="AI_BASE_URL", environ_prefix=None)
     AI_MODEL = values.Value(None, environ_name="AI_MODEL", environ_prefix=None)
+    # Dotted path of the web search tool for the default models, e.g.
+    # "chat.tools.web_search_staan.web_search_staan". Empty disables web search.
+    # (Empty string, not None: the LLM configuration resolves "settings.X"
+    # references and raises when the setting is None.)
+    AI_WEB_SEARCH = values.Value("", environ_name="AI_WEB_SEARCH", environ_prefix=None)
     AI_AGENT_INSTRUCTIONS = values.Value(
         prompts.DEFAULT_AGENT_INSTRUCTIONS,
         environ_name="AI_AGENT_INSTRUCTIONS",
