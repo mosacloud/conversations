@@ -29,6 +29,7 @@ from core.feature_flags.flags import FeatureFlags, FeatureToggle
 
 from chat.llm_configuration import cached_load_llm_configuration, load_llm_configuration
 from conversations.brave_settings import BraveSettings
+from conversations.staan_settings import StaanSettings
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,7 +48,7 @@ def get_release():
         return "NA"  # Default: not available
 
 
-class Base(BraveSettings, Configuration):
+class Base(BraveSettings, StaanSettings, Configuration):
     """
     This is the base configuration every configuration (aka environment) should inherit from. It
     is recommended to configure third-party applications by creating a configuration mixins in
@@ -725,6 +726,11 @@ class Base(BraveSettings, Configuration):
     AI_API_KEY = values.Value(None, environ_name="AI_API_KEY", environ_prefix=None)
     AI_BASE_URL = values.Value(None, environ_name="AI_BASE_URL", environ_prefix=None)
     AI_MODEL = values.Value(None, environ_name="AI_MODEL", environ_prefix=None)
+    # Dotted path of the web search tool for the default models, e.g.
+    # "chat.tools.web_search_staan.web_search_staan". Empty disables web search.
+    # (Empty string, not None: the LLM configuration resolves "settings.X"
+    # references and raises when the setting is None.)
+    AI_WEB_SEARCH = values.Value("", environ_name="AI_WEB_SEARCH", environ_prefix=None)
     AI_AGENT_INSTRUCTIONS = values.Value(
         (
             "You are a helpful assistant. "
