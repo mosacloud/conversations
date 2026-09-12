@@ -20,8 +20,8 @@ import { useConversationRouteId } from '@/utils';
 
 import { HEADER_HEIGHT } from '../conf';
 
+import { AppSwitcher } from './AppSwitcher';
 import { ButtonToggleLeftPanel } from './ButtonToggleLeftPanel';
-import { LaGaufre } from './LaGaufre';
 
 const UserInfo = lazy(() =>
   import('@/features/auth/components/UserInfo').then((mod) => ({
@@ -44,7 +44,7 @@ const headerStyles = css`
 export const Header = () => {
   const { t } = useTranslation();
   const { spacingsTokens, componentTokens } = useCunninghamTheme();
-  const showLaGaufre =
+  const showAppSwitcher =
     (componentTokens as Record<string, unknown>)['la-gaufre'] === true;
   const { isDesktop } = useResponsiveStore();
   const { setPanelOpen } = useChatPreferencesStore();
@@ -111,7 +111,7 @@ export const Header = () => {
       ) : (
         <Box $align="center" $direction="column">
           <Box $direction="row" $gap="4px" className="selector-header">
-            {showLaGaufre && <LaGaufre />}
+            {showAppSwitcher && <AppSwitcher />}
             <Suspense fallback={null}>
               <UserInfo />
             </Suspense>

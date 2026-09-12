@@ -48,48 +48,12 @@
       "withTitle": true
     }
   },
-  "waffle": {
-    "data": {
-      "services": [
-        {
-          "name": "ai",
-          "url": "https://ai.dev.mosacloud.dev/",
-          "maturity": "beta",
-          "logo": "https://ai.dev.mosacloud.dev/assets/icon-assistant.svg"
-        },
-        {
-          "name": "Docs",
-          "url": "https://docs.mosacloud.eu/",
-          "maturity": "stable",
-          "logo": "https://docs.mosacloud.eu/assets/icon-docs.svg"
-        },
-        {
-          "name": "Drive",
-          "url": "https://drive.mosacloud.eu/",
-          "maturity": "stable",
-          "logo": "https://drive.mosacloud.eu/assets/icon-drive.svg"
-        },
-        {
-          "name": "Meet",
-          "url": "https://meet.mosacloud.eu/",
-          "maturity": "stable",
-          "logo": "https://meet.mosacloud.eu/assets/icon-meet.svg"
-        },
-        {
-          "name": "Mail",
-          "url": "https://mail.mosacloud.eu/",
-          "maturity": "stable",
-          "logo": "https://mail.mosacloud.eu/assets/icon-mail.svg"
-        },
-        {
-          "name": "Calendar",
-          "url": "https://calendar.mosacloud.eu/",
-          "maturity": "stable",
-          "logo": "https://calendar.mosacloud.eu/assets/icon-calendar.svg"
-        }
-      ]
-    },
-    "showMoreLimit": 9
+  "app_switcher": {
+    "docs": "https://docs.mosacloud.eu/",
+    "drive": "https://drive.mosacloud.eu/",
+    "meet": "https://meet.mosacloud.eu/",
+    "mail": "https://mail.mosacloud.eu/",
+    "calendar": "https://calendar.mosacloud.eu/"
   },
   "home": {
     "with-proconnect": false,

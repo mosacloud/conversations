@@ -4,7 +4,7 @@ import { createGlobalStyle, css } from 'styled-components';
 import { Box, SeparatedSection } from '@/components';
 import { useCunninghamTheme } from '@/cunningham';
 import { useChatPreferencesStore } from '@/features/chat/stores/useChatPreferencesStore';
-import { LaGaufre } from '@/features/header/components/LaGaufre';
+import { AppSwitcher } from '@/features/header/components/AppSwitcher';
 import { OnboardingButton } from '@/features/onboarding';
 import { SettingsButton } from '@/features/settings';
 import { useResponsiveStore } from '@/stores';
@@ -28,7 +28,7 @@ export const LeftPanel = () => {
   const { isDesktop } = useResponsiveStore();
 
   const { spacingsTokens, componentTokens } = useCunninghamTheme();
-  const showLaGaufre =
+  const showAppSwitcher =
     (componentTokens as Record<string, unknown>)['la-gaufre'] === true;
   const { setPanelOpen, isPanelOpen } = useChatPreferencesStore();
 
@@ -132,7 +132,7 @@ export const LeftPanel = () => {
                   $gap={spacingsTokens['sm']}
                   $align="center"
                 >
-                  {showLaGaufre && <LaGaufre />}
+                  {showAppSwitcher && <AppSwitcher />}
                   <Suspense fallback={null}>
                     <UserInfo />
                   </Suspense>
