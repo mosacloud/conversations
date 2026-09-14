@@ -40,22 +40,24 @@ def test_normalize_staan_results_flattens_scored_chunks():
     """Scored chunks are flattened to plain snippets, keeping score order."""
     normalized = _normalize_staan_results(
         {
-            "results": [
-                {
-                    "url": "https://example.eu/a",
-                    "title": "Result A",
-                    "snippet": "Plain snippet A",
-                    "extra_snippets": [
-                        {"chunk": "Chunk A1", "score": 0.9},
-                        {"chunk": "Chunk A2", "score": 0.5},
-                    ],
-                },
-                {
-                    "url": "https://example.eu/b",
-                    "title": "Result B",
-                    "snippet": "Plain snippet B",
-                },
-            ]
+            "web": {
+                "results": [
+                    {
+                        "url": "https://example.eu/a",
+                        "title": "Result A",
+                        "snippet": "Plain snippet A",
+                        "extra_snippets": [
+                            {"chunk": "Chunk A1", "score": 0.9},
+                            {"chunk": "Chunk A2", "score": 0.5},
+                        ],
+                    },
+                    {
+                        "url": "https://example.eu/b",
+                        "title": "Result B",
+                        "snippet": "Plain snippet B",
+                    },
+                ]
+            }
         }
     )
     assert normalized == [
@@ -80,14 +82,16 @@ async def test_web_search_staan_success(mocked_context):
         return_value=httpx.Response(
             status_code=200,
             json={
-                "results": [
-                    {
-                        "url": "https://example.eu/a",
-                        "title": "Result A",
-                        "snippet": "Plain snippet A",
-                        "extra_snippets": [{"chunk": "Chunk A1", "score": 0.9}],
-                    }
-                ]
+                "web": {
+                    "results": [
+                        {
+                            "url": "https://example.eu/a",
+                            "title": "Result A",
+                            "snippet": "Plain snippet A",
+                            "extra_snippets": [{"chunk": "Chunk A1", "score": 0.9}],
+                        }
+                    ]
+                }
             },
         )
     )
