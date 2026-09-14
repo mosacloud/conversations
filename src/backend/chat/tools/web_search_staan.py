@@ -37,7 +37,7 @@ def _normalize_staan_results(json_response: dict) -> List[dict]:
     `format_tool_return` expects, keeping the plain snippet as a fallback.
     """
     normalized = []
-    for result in json_response.get("results", []):
+    for result in json_response.get("web", {}).get("results", []):
         chunks = [
             chunk["chunk"]
             for chunk in result.get("extra_snippets") or []
