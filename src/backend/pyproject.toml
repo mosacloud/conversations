@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conversations"
-version = "0.0.19"
+version = "0.0.24"
 authors = [{ "name" = "DINUM", "email" = "dev@mail.numerique.gouv.fr" }]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -28,6 +28,7 @@ dependencies = [
     "beautifulsoup4==4.15.0",
     "boto3==1.43.24",
     "Brotli==1.2.0",
+    "celery[redis]==5.6.3",
     "django-configurations==2.5.1",
     "django-cors-headers==4.9.0",
     "django-filter==25.2",
@@ -36,36 +37,34 @@ dependencies = [
     "django-redis==6.0.0",
     "django-storages[s3]==1.14.6",
     "django-timezone-field>=5.1",
-    "django==5.2.14",
-    "djangorestframework==3.17.1",
+    "django==5.2.17",
+    "djangorestframework==3.17.2",
     "drf_spectacular==0.29.0",
     "dockerflow==2026.3.4",
     "factory_boy==3.3.3",
     "gunicorn==26.0.0",
+    "httpx==0.28.1",
     "jsonschema==4.26.0",
     "langfuse==4.7.1",
     "lxml==6.1.1",
     "markdown==3.10.2",
     "markitdown==0.0.2",
-    # Direct pin to patch CVE-2026-59950 (transitive via pydantic-ai-slim[mcp]).
-    # Drop on the next upstream rebase once conversations ships mcp>=1.28.1.
-    "mcp>=1.28.1",
     "mozilla-django-oidc==4.0.1",
     "nested-multipart-parser==1.6.0",
     "posthog==7.18.0",
     "pydantic==2.13.4",
-    "pydantic-ai-slim[openai,mistral,mcp,evals,logfire]==1.106.0",
+    "pydantic-ai-slim[openai,mistral,mcp]==2.22.0",
     "psycopg[binary]==3.3.4",
     "PyJWT==2.13.0",
     "python-magic==0.4.27",
+    "python-pptx==1.0.2",
     "redis<6.0.0",
-    "requests==2.34.2",
     "semchunk==4.0.0",
     "sentry-sdk==2.61.1",
     "trafilatura==2.1.0",
     "uvicorn==0.49.0",
-    "whitenoise==6.12.0",
-    "pypdf==6.13.0",
+    "servestatic==4.3.2",
+    "pypdf==6.16.1",
     "odfdo==3.22.8",
     "django-solo==2.5.1",
     "tiktoken==0.13.0",
@@ -90,17 +89,19 @@ dev = [
     "pylint-django==2.7.0",
     "pylint==4.0.5",
     "pylint-pydantic==0.4.1",
+    "pydantic-evals==2.22.0",
+    "logfire==4.41.0",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
     "pytest-django==4.12.0",
+    "pytest-dotenv==0.5.2",
     "pytest==9.0.3",
     "pytest-icdiff==0.9",
     "pytest-xdist==3.8.0",
     "responses==0.26.1",
     "respx==0.23.1",
     "ruff==0.15.16",
-    "types-requests==2.33.0.20260518",
-    "debugpy>=1.8.20",    
+    "debugpy>=1.8.20",
 ]
 
 [tool.setuptools]
@@ -117,11 +118,13 @@ required-environments = [
     "sys_platform == 'darwin'",
 ]
 override-dependencies = [
-    "cryptography>=48.0.1", # GHSA-537c-gmf6-5ccf
-    "joserfc>=1.6.3", # CVE-2026-27932
+    "cryptography>=50.0.0", # GHSA-g6cj-pr64-35w5
+    "joserfc>=1.6.8", # CVE-2026-49852
     "pillow>=12.2.0", #CVE-2026-40192
-    "python-multipart>=0.0.30", # CVE-2026-53539
-   "starlette>=1.3.1", # CVE-2026-48818, CVE-2026-54283
+    "python-multipart>=0.0.31", # CVE-2026-53539
+    "starlette>=1.3.1", # CVE-2026-48818, CVE-2026-54283,
+    "pyjwt>=2.13.0", #CVE-2026-48526
+    "pydantic-settings>=2.14.2", # GHSA-4xgf-cpjx-pc3j
 ]
 
 [tool.uv.build-backend]
@@ -181,4 +184,13 @@ addopts = [
 python_files = [
     "test_*.py",
     "tests.py",
+]
+# For host-run pytest and CI (docker uses the app-test service env_file instead),
+# load the dedicated, deterministic test environment. env.d/test carries the
+# behavior settings; the repo-root .env carries host infra topology (DB/S3 ports).
+# Existing process env is never overridden, so the CI job env (localhost/5432)
+# wins over .env's host ports (localhost/15432).
+env_files = [
+    "env.d/test",
+    ".env",
 ]

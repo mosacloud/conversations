@@ -1,0 +1,75 @@
+# Mosa development configuration — copy to env.d/development/common
+# (or run `make create-env-files` first and overlay these values).
+#
+# Secrets are FILL_ME placeholders: ask a teammate for the shared dev values
+# (never commit them — this repo is public).
+
+# Django
+DJANGO_ALLOWED_HOSTS=*
+DJANGO_SECRET_KEY=ThisIsAnExampleKeyForDevPurposeOnly
+DJANGO_SETTINGS_MODULE=conversations.settings
+DJANGO_SUPERUSER_PASSWORD=admin
+
+# Logging
+LOGGING_LEVEL_HANDLERS_CONSOLE=INFO
+LOGGING_LEVEL_LOGGERS_ROOT=INFO
+LOGGING_LEVEL_LOGGERS_APP=INFO
+
+# Python
+PYTHONPATH=/app
+
+# Mail
+DJANGO_EMAIL_BRAND_NAME="Mosa"
+DJANGO_EMAIL_HOST="maildev"
+DJANGO_EMAIL_LOGO_IMG="http://localhost:3000/assets/logo-suite-numerique.png"
+DJANGO_EMAIL_PORT=1025
+
+# Backend url
+CONVERSATIONS_BASE_URL="http://localhost:8072"
+
+# Media
+STORAGES_STATICFILES_BACKEND=django.contrib.staticfiles.storage.StaticFilesStorage
+AWS_S3_ENDPOINT_URL=http://minio:9000
+AWS_S3_ACCESS_KEY_ID=conversations
+AWS_S3_SECRET_ACCESS_KEY=password
+MEDIA_BASE_URL=http://localhost:8083
+
+# OIDC — Mosa Zitadel (dev). The Zitadel app must list
+# http://localhost:8071/api/v1.0/callback/ as redirect URI (Dev Mode on).
+OIDC_OP_JWKS_ENDPOINT=https://identity.dev.mosacloud.eu/oauth/v2/keys
+OIDC_OP_AUTHORIZATION_ENDPOINT=https://identity.dev.mosacloud.eu/oauth/v2/authorize
+OIDC_OP_TOKEN_ENDPOINT=https://identity.dev.mosacloud.eu/oauth/v2/token
+OIDC_OP_USER_ENDPOINT=https://identity.dev.mosacloud.eu/oidc/v1/userinfo
+
+OIDC_RP_CLIENT_ID=FILL_ME_ZITADEL_CLIENT_ID
+OIDC_RP_CLIENT_SECRET=FILL_ME_ZITADEL_CLIENT_SECRET
+OIDC_RP_SIGN_ALGO=RS256
+OIDC_RP_SCOPES="openid email profile"
+
+LOGIN_REDIRECT_URL=http://localhost:3000
+LOGIN_REDIRECT_URL_FAILURE=http://localhost:3000
+LOGOUT_REDIRECT_URL=http://localhost:3000
+
+OIDC_REDIRECT_ALLOWED_HOSTS=["http://localhost:8083", "http://localhost:3000"]
+
+# AI — OpenAI-compatible endpoint (feeds the default LLM_CONFIGURATIONS)
+AI_AGENT_INSTRUCTIONS=You are Mosa ai, the AI assistant of mosa.cloud — the European, privacy-friendly digital workspace (Docs, Drive, Meet, Mail, Calendar and more). You help users draft, rewrite and summarize documents and mails, explain things clearly, write code, and brainstorm ideas. Be warm, concise and practical; use a light touch of humor when it fits, never at the expense of clarity. Always answer in the user's language (usually Dutch or English). When a task touches documents or mail, you may suggest the relevant Mosa app. If you don't know something, say so honestly instead of guessing.
+AI_BASE_URL=https://openai.scailabs.ai/v1
+AI_API_KEY=FILL_ME_SCAILABS_API_KEY
+AI_MODEL=scailabs/poolnoodle-omni
+
+# Web search — Staan (EU-sovereign, staan.ai)
+STAAN_API_KEY=FILL_ME_STAAN_API_KEY
+AI_WEB_SEARCH=chat.tools.web_search_staan.web_search_staan
+FEATURE_FLAG_WEB_SEARCH=ENABLED
+
+# Slide deck generation
+FEATURE_FLAG_PRESENTATION_GENERATION=ENABLED
+
+# Docs integration — "Edit in Docs". Point at your own tenant's Docs.
+# Requires the Zitadel client to share the project with the Docs app, and the
+# /external_api ingress route + resource-server config on the Docs deployment
+# (pending, see infra repo).
+DOCS_BASE_URL=https://docs.YOURTENANT.dev.mosacloud.eu
+DOCS_API_TIMEOUT=30
+OIDC_STORE_ACCESS_TOKEN=True

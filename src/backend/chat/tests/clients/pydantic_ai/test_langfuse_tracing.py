@@ -13,6 +13,7 @@ from core.factories import UserFactory
 from chat.ai_sdk_types import TextUIPart, UIMessage
 from chat.clients.pydantic_ai import AIAgentService
 from chat.factories import ChatConversationFactory
+from chat.tests.utils import stream_text
 
 pytestmark = pytest.mark.django_db()
 
@@ -41,16 +42,6 @@ def langfuse_client_fixture():
     langfuse_client._resources.prompt_cache._task_manager.shutdown()  # pylint: disable=protected-access
     langfuse_client.shutdown()
     LangfuseResourceManager._instances.pop("pk-test-key", None)  # pylint: disable=protected-access
-
-
-@pytest.fixture(autouse=True)
-def base_settings(settings):
-    """Set up base settings for the tests."""
-    settings.AI_BASE_URL = "https://api.llm.com/v1/"
-    settings.AI_API_KEY = "test-key"
-    settings.AI_MODEL = "model-123"
-    settings.AI_AGENT_INSTRUCTIONS = "You are a helpful assistant"
-    settings.AI_AGENT_TOOLS = []
 
 
 @pytest.fixture(autouse=True)
@@ -112,11 +103,11 @@ async def test_langfuse_span_created_when_enabled_and_analytics_allowed(
     service = AIAgentService(conversation, user=user)
     results = []
     with service.conversation_agent.override(model=agent_model):
-        async for result in service.stream_text_async(ui_messages):
+        async for result in service.stream_data_async(ui_messages):
             results.append(result)
 
     # Verify that results were generated
-    assert results == ["Hello! I'm doing well, thank you for asking."]
+    assert stream_text(results) == "Hello! I'm doing well, thank you for asking."
 
     langfuse_client.flush()
 
@@ -163,11 +154,11 @@ async def test_langfuse_span_created_when_enabled_and_analytics_disabled(
     service = AIAgentService(conversation, user=user)
     results = []
     with service.conversation_agent.override(model=agent_model):
-        async for result in service.stream_text_async(ui_messages):
+        async for result in service.stream_data_async(ui_messages):
             results.append(result)
 
     # Verify that results were generated
-    assert results == ["Hello! I'm doing well, thank you for asking."]
+    assert stream_text(results) == "Hello! I'm doing well, thank you for asking."
 
     langfuse_client.flush()
 
@@ -184,9 +175,8 @@ async def test_langfuse_span_created_when_enabled_and_analytics_disabled(
 
 @pytest.mark.asyncio
 @responses.activate
-async def test_no_langfuse_span_when_disabled(agent_model, ui_messages, settings, langfuse_client):
+async def test_no_langfuse_span_when_disabled(agent_model, ui_messages, langfuse_client):
     """Test Langfuse span is not created when Langfuse is disabled."""
-    settings.LANGFUSE_ENABLED = False
 
     # Mock Langfuse HTTP endpoints (should not be called)
     responses.add(
@@ -202,11 +192,11 @@ async def test_no_langfuse_span_when_disabled(agent_model, ui_messages, settings
     service = AIAgentService(conversation, user=user)
     results = []
     with service.conversation_agent.override(model=agent_model):
-        async for result in service.stream_text_async(ui_messages):
+        async for result in service.stream_data_async(ui_messages):
             results.append(result)
 
     # Verify that results were generated
-    assert results == ["Hello! I'm doing well, thank you for asking."]
+    assert stream_text(results) == "Hello! I'm doing well, thank you for asking."
 
     langfuse_client.flush()
 
@@ -252,10 +242,9 @@ async def test_instrumentation_settings_with_analytics_disabled(settings):
 
 
 @pytest.mark.asyncio
-async def test_instrumentation_disabled_when_langfuse_disabled(settings):
+async def test_instrumentation_disabled_when_langfuse_disabled():
     """Test service correctly sets flags when Langfuse is disabled."""
     # pylint: disable=protected-access
-    settings.LANGFUSE_ENABLED = False
 
     user = await sync_to_async(UserFactory)(allow_conversation_analytics=True)
     conversation = await sync_to_async(ChatConversationFactory)(owner=user)
@@ -295,10 +284,9 @@ def test_store_analytics_flag_when_langfuse_enabled_and_user_disallows(settings)
     assert service._store_analytics is False
 
 
-def test_store_analytics_flag_when_langfuse_disabled(settings):
+def test_store_analytics_flag_when_langfuse_disabled():
     """Test _store_analytics is False when Langfuse is disabled."""
     # pylint: disable=protected-access
-    settings.LANGFUSE_ENABLED = False
 
     user = UserFactory(allow_conversation_analytics=True)
     conversation = ChatConversationFactory(owner=user)

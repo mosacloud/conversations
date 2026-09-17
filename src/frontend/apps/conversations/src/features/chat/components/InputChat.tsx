@@ -1,3 +1,5 @@
+import { Button } from '@gouvfr-lasuite/cunningham-react';
+import { ArrowSquarepath, FileDelete } from '@gouvfr-lasuite/ui-kit/icons';
 import React, {
   useCallback,
   useEffect,
@@ -7,14 +9,15 @@ import React, {
 } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import WarningFilledIcon from '@/assets/icons/uikit-custom/warning-filled.svg';
-import { Box, Text } from '@/components';
+import WarningFilledIcon from '@/assets/icons/uikit-custom/warning-filled.svg?react';
+import { Box, Loader, Text } from '@/components';
 import { useToast } from '@/components/ToastProvider';
 import { useConfig, useFeatureEnabled } from '@/core';
 import { useAssistantHealth } from '@/features/chat/api/useAssistantHealth';
 import { LLMModel } from '@/features/chat/api/useLLMConfiguration';
 import { ChatErrorType } from '@/features/chat/components/ChatError';
 import { InputChatActions } from '@/features/chat/components/InputChatAction';
+import { InputChatBanner } from '@/features/chat/components/InputChatBanner';
 import { ProjectWelcomeMessage } from '@/features/chat/components/ProjectWelcomeMessage';
 import { SuggestionCarousel } from '@/features/chat/components/SuggestionCarousel';
 import { WelcomeMessage } from '@/features/chat/components/WelcomeMessage';
@@ -22,7 +25,7 @@ import { useFileDragDrop } from '@/features/chat/hooks/useFileDragDrop';
 import { useFileUrls } from '@/features/chat/hooks/useFileUrls';
 import { useResponsiveStore } from '@/stores';
 
-import FilesIcon from '../assets/files.svg';
+import FilesIcon from '../assets/files.svg?react';
 
 import { AttachmentList } from './AttachmentList';
 import { ScrollDown } from './ScrollDown';
@@ -51,6 +54,10 @@ interface InputChatProps {
   selectedModel?: LLMModel | null;
   onModelSelect?: (model: LLMModel) => void;
   isUploadingFiles?: boolean;
+  isIndexingFiles?: boolean;
+  failedIndexingCount?: number;
+  onRetryFailedIndexing?: () => void;
+  isRetryingIndexing?: boolean;
   errorType?: ChatErrorType;
   cooldownUntil?: number | null;
 }
@@ -91,14 +98,6 @@ const FILE_DROP_CSS = `
                 outline: 2px solid var(--c--contextuals--border--semantic--brand--secondary);
                 box-shadow: 0 0 64px 0 rgba(62, 93, 231, 0.25);
                 `;
-const COOLDOWN_BANNER_CSS = `
-                padding: 8px 16px;
-                border-top-left-radius: 12px;
-                border-top-right-radius: 12px;
-                border-bottom: 1px solid var(--c--contextuals--border--surface--primary);
-                background: var(--c--contextuals--background--semantic--warning--tertiary);
-                text-align: center;
-                `;
 const DRAG_FADE_CSS = `
             top: 0;
             left: 0;
@@ -109,6 +108,10 @@ const DRAG_FADE_CSS = `
             background-color: rgba(255, 255, 255, 0.1);
             pointer-events: all;
           `;
+
+// The ui-kit ArrowSquarepath draws vertical arrows; the design wants them
+// horizontal (top arrow pointing right, bottom arrow pointing left).
+const ROTATE_90_STYLE: React.CSSProperties = { transform: 'rotate(90deg)' };
 
 const TEXTAREA_STYLE: React.CSSProperties = {
   padding: '1rem 1.5rem 0.5rem 1.5rem',
@@ -149,6 +152,10 @@ export const InputChat = ({
   selectedModel,
   onModelSelect,
   isUploadingFiles = false,
+  isIndexingFiles = false,
+  failedIndexingCount = 0,
+  onRetryFailedIndexing,
+  isRetryingIndexing = false,
   errorType,
   cooldownUntil = null,
 }: InputChatProps) => {
@@ -162,6 +169,8 @@ export const InputChat = ({
   const { data: conf } = useConfig();
   const fileUploadEnabled = useFeatureEnabled('document-upload');
   const webSearchEnabled = useFeatureEnabled('web-search');
+
+  const { data: assistantHealth } = useAssistantHealth();
 
   const isFileAccepted = useCallback(
     (file: File): boolean => {
@@ -265,7 +274,6 @@ export const InputChat = ({
     onFilesRejected: () => showToastError(),
   });
 
-  const { data: assistantHealth } = useAssistantHealth();
   const isAssistantBlocked = assistantHealth?.blocked ?? false;
 
   // Inference-load cooldown: count down to the time the user may send again.
@@ -290,7 +298,8 @@ export const InputChat = ({
 
   // During a cooldown the textarea stays enabled so the user can still draft a
   // message; only sending is blocked (see handleTextareaKeyDown + the send
-  // button below, and the submit guard in Chat).
+  // button below). Indexing no longer blocks sending: the banner warns that
+  // still-indexing files are ignored, and the user decides whether to wait.
   const isInputDisabled =
     !INPUT_ENABLED_STATUSES.includes(
       status as (typeof INPUT_ENABLED_STATUSES)[number],
@@ -468,6 +477,46 @@ export const InputChat = ({
 
         <form onSubmit={handleFormSubmit} style={STYLES.form}>
           <Box $padding={formPadding}>
+            {isIndexingFiles && (
+              <InputChatBanner
+                variant="neutral"
+                icon={<Loader />}
+                text={t(
+                  'Files related to this project are being indexed and will be ignored.',
+                )}
+              />
+            )}
+            {failedIndexingCount > 0 && !isIndexingFiles && (
+              <InputChatBanner
+                variant="error"
+                icon={<FileDelete size={18} />}
+                text={t(
+                  '{{number}} project file(s) failed to index and are not searchable.',
+                  { number: failedIndexingCount },
+                )}
+                action={
+                  <Button
+                    size="nano"
+                    color="error"
+                    variant="tertiary"
+                    icon={<ArrowSquarepath size={18} style={ROTATE_90_STYLE} />}
+                    onClick={onRetryFailedIndexing}
+                    disabled={isRetryingIndexing || !onRetryFailedIndexing}
+                  >
+                    {t('Retry')}
+                  </Button>
+                }
+              />
+            )}
+            {cooldownRemaining > 0 && (
+              <InputChatBanner
+                icon={<WarningFilledIcon width={20} height={20} />}
+                text={t(
+                  'The model is under heavy load. You can send a new message in {{seconds}}s.',
+                  { seconds: cooldownRemaining },
+                )}
+              />
+            )}
             <Box
               $flex={1}
               $radius="12px"
@@ -501,28 +550,6 @@ export const InputChat = ({
                   </Box>
                 </Box>
               )}
-              {cooldownRemaining > 0 && (
-                <Box
-                  role="status"
-                  $align="center"
-                  $direction="row"
-                  $justify="center"
-                  $gap="8px"
-                  $css={COOLDOWN_BANNER_CSS}
-                >
-                  <WarningFilledIcon width={20} height={20} />
-                  <Text
-                    $weight="700"
-                    $size="sm"
-                    $color="var(--c--contextuals--content--semantic--warning--primary)"
-                  >
-                    {t(
-                      'The model is under heavy load. You can send a new message in {{seconds}}s.',
-                      { seconds: cooldownRemaining },
-                    )}
-                  </Text>
-                </Box>
-              )}
               <textarea
                 ref={textareaRef}
                 aria-label={t('Enter your message or a question')}
@@ -537,19 +564,24 @@ export const InputChat = ({
                 style={textareaStyle}
               />
 
-              {!input && !textareaPlaceholder && cooldownRemaining <= 0 && (
-                <SuggestionCarousel
-                  messagesLength={messagesLength}
-                  blocked={isAssistantBlocked}
-                  banners={assistantHealth?.banners ?? []}
-                />
-              )}
+              {!input &&
+                !textareaPlaceholder &&
+                cooldownRemaining <= 0 &&
+                !isIndexingFiles &&
+                failedIndexingCount === 0 && (
+                  <SuggestionCarousel
+                    messagesLength={messagesLength}
+                    blocked={isAssistantBlocked}
+                    banners={assistantHealth?.banners ?? []}
+                  />
+                )}
 
               <input
                 accept={conf?.chat_upload_accept}
                 type="file"
                 multiple
                 ref={fileInputRef}
+                data-testid="chat-file-input"
                 style={{ display: 'none' }}
                 onChange={handleFileChange}
               />

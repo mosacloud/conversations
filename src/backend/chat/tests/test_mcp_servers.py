@@ -5,7 +5,8 @@ import json
 from django.test import override_settings
 
 import pytest
-from pydantic_ai.mcp import MCPServerSSE, MCPServerStreamableHTTP
+from fastmcp.client.transports import SSETransport, StreamableHttpTransport
+from pydantic_ai.mcp import MCPToolset
 
 from chat.mcp_servers import (
     _resolve_env,
@@ -35,8 +36,10 @@ def test_no_configuration_returns_no_servers():
 def test_inline_json_builds_servers_with_selected_transport():
     servers = get_mcp_servers()
     assert len(servers) == 2
-    assert isinstance(servers[0], MCPServerStreamableHTTP)
-    assert isinstance(servers[1], MCPServerSSE)
+    assert isinstance(servers[0], MCPToolset)
+    assert isinstance(servers[0].client.transport, StreamableHttpTransport)
+    assert isinstance(servers[1], MCPToolset)
+    assert isinstance(servers[1].client.transport, SSETransport)
 
 
 @override_settings(MCP_SERVERS_CONFIGURATION=None, MCP_SERVERS_CONFIGURATION_FILE_PATH=None)
@@ -48,7 +51,8 @@ def test_transport_defaults_to_streamable_http():
     ):
         servers = get_mcp_servers()
     assert len(servers) == 1
-    assert isinstance(servers[0], MCPServerStreamableHTTP)
+    assert isinstance(servers[0], MCPToolset)
+    assert isinstance(servers[0].client.transport, StreamableHttpTransport)
 
 
 def test_file_path_takes_precedence_over_inline(tmp_path):

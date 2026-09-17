@@ -3,8 +3,9 @@
 import logging
 from unittest import mock
 
+import httpx
 import pytest
-import responses
+import respx
 from botocore.exceptions import ClientError
 from rest_framework import status
 
@@ -19,11 +20,6 @@ pytestmark = pytest.mark.django_db
 @pytest.fixture(name="albert_settings")
 def fixture_albert_settings(settings):
     """Configure Albert backend so collection cleanup hits a known URL."""
-    settings.RAG_DOCUMENT_SEARCH_BACKEND = (
-        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend"
-    )
-    settings.ALBERT_API_URL = "https://albert.api.etalab.gouv.fr"
-    settings.ALBERT_API_KEY = "albert-api-key"
     return settings
 
 
@@ -63,13 +59,12 @@ def test_delete_conversation_anonymous(api_client):
     assert ChatConversation.objects.filter(id=chat_conversation.pk).exists()
 
 
-@responses.activate
+@respx.mock
 def test_delete_conversation_drops_rag_collection(api_client, albert_settings):
     """Deleting a conversation removes its RAG collection on the backend."""
     conversation = ChatConversationFactory(collection_id="11")
-    delete_mock = responses.delete(
-        f"{albert_settings.ALBERT_API_URL}/v1/collections/11",
-        status=status.HTTP_204_NO_CONTENT,
+    delete_mock = respx.delete(f"{albert_settings.ALBERT_API_URL}/v1/collections/11").mock(
+        return_value=httpx.Response(status.HTTP_204_NO_CONTENT)
     )
 
     api_client.force_login(conversation.owner)
@@ -80,13 +75,12 @@ def test_delete_conversation_drops_rag_collection(api_client, albert_settings):
     assert not ChatConversation.objects.filter(id=conversation.pk).exists()
 
 
-@responses.activate
+@respx.mock
 def test_delete_conversation_without_collection_skips_backend(api_client, albert_settings):
     """A conversation that never indexed anything must not call the RAG backend."""
     conversation = ChatConversationFactory(collection_id=None)
-    delete_mock = responses.delete(
-        f"{albert_settings.ALBERT_API_URL}/v1/collections/anything",
-        status=status.HTTP_204_NO_CONTENT,
+    delete_mock = respx.delete(f"{albert_settings.ALBERT_API_URL}/v1/collections/anything").mock(
+        return_value=httpx.Response(status.HTTP_204_NO_CONTENT)
     )
 
     api_client.force_login(conversation.owner)
@@ -96,13 +90,12 @@ def test_delete_conversation_without_collection_skips_backend(api_client, albert
     assert delete_mock.call_count == 0
 
 
-@responses.activate
+@respx.mock
 def test_delete_conversation_succeeds_when_backend_fails(api_client, albert_settings, caplog):
     """A backend failure must be logged but must not block the conversation delete."""
     conversation = ChatConversationFactory(collection_id="11")
-    responses.delete(
-        f"{albert_settings.ALBERT_API_URL}/v1/collections/11",
-        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    respx.delete(f"{albert_settings.ALBERT_API_URL}/v1/collections/11").mock(
+        return_value=httpx.Response(status.HTTP_500_INTERNAL_SERVER_ERROR)
     )
     caplog.set_level(logging.ERROR, logger="chat.views")
 
@@ -143,7 +136,7 @@ def test_delete_conversation_cleans_up_s3_blobs(api_client):
     )
     api_client.force_login(conversation.owner)
 
-    with mock.patch("chat.views.default_storage.delete") as storage_delete:
+    with mock.patch("chat.views.helpers.default_storage.delete") as storage_delete:
         response = api_client.delete(f"/api/v1.0/chats/{conversation.pk}/")
 
     assert response.status_code == status.HTTP_204_NO_CONTENT
@@ -165,7 +158,7 @@ def test_delete_conversation_tolerates_s3_failure(api_client, caplog):
     caplog.set_level(logging.ERROR, logger="chat.views")
 
     with mock.patch(
-        "chat.views.default_storage.delete",
+        "chat.views.helpers.default_storage.delete",
         side_effect=ClientError({"Error": {"Code": "InternalError"}}, "DeleteObject"),
     ):
         response = api_client.delete(f"/api/v1.0/chats/{conversation.pk}/")

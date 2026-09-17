@@ -1,12 +1,11 @@
 {
   "name": "eslint-config-conversations",
-  "version": "0.0.19",
+  "version": "0.0.24",
   "license": "MIT",
   "scripts": {
     "lint": "eslint ."
   },
   "dependencies": {
-    "@next/eslint-plugin-next": "16.2.6",
     "@tanstack/eslint-plugin-query": "5.100.14",
     "@typescript-eslint/eslint-plugin": "*",
     "@typescript-eslint/parser": "*",

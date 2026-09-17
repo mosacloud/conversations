@@ -12,9 +12,7 @@ Test the user-visible behavior of the silent-fallback removal:
 """
 
 import json
-from unittest import mock
 
-from django.contrib.sessions.backends.cache import SessionStore
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 
@@ -37,26 +35,8 @@ pytestmark = pytest.mark.django_db(transaction=True)
 @pytest.fixture(autouse=True)
 def ai_settings(settings):
     """Configure AI service URLs and the Albert backend."""
-    settings.RAG_DOCUMENT_SEARCH_BACKEND = (
-        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend"
-    )
-    settings.AI_BASE_URL = "https://www.external-ai-service.com/"
-    settings.AI_API_KEY = "test-api-key"
-    settings.AI_MODEL = "test-model"
     settings.AI_AGENT_INSTRUCTIONS = "You are a helpful test assistant :)"
-    settings.ALBERT_API_URL = "https://albert.api.etalab.gouv.fr"
-    settings.ALBERT_API_KEY = "albert-api-key"
     return settings
-
-
-@pytest.fixture(autouse=True)
-def mock_refresh_access_token():
-    """Bypass token refresh during the request."""
-    with mock.patch("utils.oidc.refresh_access_token") as mocked:
-        session = SessionStore()
-        session["oidc_access_token"] = "mocked-access-function"
-        mocked.return_value = session
-        yield mocked
 
 
 @respx.mock

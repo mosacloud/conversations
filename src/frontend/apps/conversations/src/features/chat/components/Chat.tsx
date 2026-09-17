@@ -1,8 +1,13 @@
-import { Message, SourceUIPart } from '@ai-sdk/ui-utils';
-import { Modal, ModalSize } from '@gouvfr-lasuite/cunningham-react';
+import { Button, Modal, ModalSize } from '@gouvfr-lasuite/cunningham-react';
 import { InfiniteData, useQueryClient } from '@tanstack/react-query';
+import {
+  FileUIPart,
+  SourceUrlUIPart,
+  UIMessage,
+  getToolName,
+  isToolUIPart,
+} from 'ai';
 import 'katex/dist/katex.min.css'; // `rehype-katex` does not import the CSS for you
-import { useRouter } from 'next/router';
 import React, {
   useCallback,
   useEffect,
@@ -11,13 +16,27 @@ import React, {
   useState,
 } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router';
 
-import { APIError, errorCauses, fetchAPI } from '@/api';
-import { Box, Icon, Loader, Text } from '@/components';
+import {
+  APIError,
+  errorCauses,
+  fetchAPI,
+  isRateLimitError,
+  rateLimitMessage,
+} from '@/api';
+import { Box, HorizontalSeparator, Icon, Loader, Text } from '@/components';
 import { useConfig } from '@/core';
+import { useProjectAttachments } from '@/features/attachments/api/useProjectAttachments';
+import { useReindexProjectAttachment } from '@/features/attachments/api/useReindexProjectAttachment';
 import { useUploadFile } from '@/features/attachments/hooks/useUploadFile';
-import { isContextTrimmedEvent, useChat } from '@/features/chat/api/useChat';
+import {
+  ImagesSkippedEventKind,
+  stampImagesSkippedOnLatestUserMessage,
+  useChat,
+} from '@/features/chat/api/useChat';
 import { getConversation } from '@/features/chat/api/useConversation';
 import { useCreateChatConversation } from '@/features/chat/api/useCreateConversation';
 import {
@@ -29,12 +48,15 @@ import {
   ProjectsResponse,
 } from '@/features/chat/api/useProjects';
 import { ChatError, ChatErrorType } from '@/features/chat/components/ChatError';
+import { ImageProcessingUnavailableBanner } from '@/features/chat/components/ImageProcessingUnavailableBanner';
 import { InputChat } from '@/features/chat/components/InputChat';
 import { MessageItem } from '@/features/chat/components/MessageItem';
+import { SourceItemList } from '@/features/chat/components/SourceItemList';
 import {
   STATUS_LINK_KINDS,
   getReindexErrorMessage,
 } from '@/features/chat/components/reindexErrorMessages';
+import { useSourcePanelAnchor } from '@/features/sources-panel';
 import { useClipboard } from '@/hook';
 import { useResponsiveStore } from '@/stores';
 
@@ -51,7 +73,13 @@ const PROVIDER_ERROR_CODES = new Set<ChatErrorType>([
   'model_not_found',
   'model_wrong_type',
   'model_busy',
+  'summarization_failed',
 ]);
+
+const IMAGES_BANNER_STORAGE_PREFIX = 'conversations:images-banner-dismissed:';
+
+const imagesBannerStorageKey = (conversationId: string) =>
+  `${IMAGES_BANNER_STORAGE_PREFIX}${conversationId}`;
 
 // Define Attachment type locally (mirroring backend structure)
 export interface Attachment {
@@ -69,15 +97,15 @@ export const Chat = ({
   const { data: config } = useConfig();
   const statusPageUrl = config?.STATUS_PAGE_URL;
   const copyToClipboard = useClipboard();
-  const { isMobile } = useResponsiveStore();
-
-  const streamProtocol = 'data'; // or 'text'
+  const { isMobile, isDesktop } = useResponsiveStore();
+  const sourcesPanelAnchorEl = useSourcePanelAnchor();
 
   const {
     forceWebSearch,
     toggleForceWebSearch,
     selectedModelHrid,
     setSelectedModelHrid,
+    setSourcesPanelOpen,
   } = useChatPreferencesStore();
 
   const { data: llmConfig } = useLLMConfiguration();
@@ -85,8 +113,8 @@ export const Chat = ({
 
   const [conversationId, setConversationId] = useState(initialConversationId);
   const apiUrl = conversationId
-    ? `chats/${conversationId}/conversation/?protocol=${streamProtocol}`
-    : `chats/conversation/?protocol=${streamProtocol}`;
+    ? `chats/${conversationId}/conversation/`
+    : 'chats/conversation/';
 
   // Initialize upload hook
   const { uploadFile, isErrorAttachment, errorAttachment } = useUploadFile(
@@ -128,9 +156,13 @@ export const Chat = ({
     setSelectedModelHrid(model.hrid);
   };
 
-  const router = useRouter();
+  const navigate = useNavigate();
   const [files, setFiles] = useState<FileList | null>(null);
   const [isUploadingFiles, setIsUploadingFiles] = useState(false);
+  // Project of an already-loaded conversation (new chats use pendingProjectId).
+  const [conversationProjectId, setConversationProjectId] = useState<
+    string | null
+  >(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
@@ -164,9 +196,15 @@ export const Chat = ({
   const { prefetchMetadata, getMetadata } = useSourceMetadataCache();
 
   const [initialConversationMessages, setInitialConversationMessages] =
-    useState<Message[] | undefined>(undefined);
+    useState<UIMessage[] | undefined>(undefined);
+  // True when the pinned model is text-only and any image exists in the
+  // conversation (project or history). Drives the "image processing
+  // unavailable" banner above the input box.
+  const [imagesSkipped, setImagesSkipped] = useState<boolean>(false);
+  const [imagesBannerDismissed, setImagesBannerDismissed] =
+    useState<boolean>(false);
   const [pendingFirstMessage, setPendingFirstMessage] = useState<{
-    event: FormEvent<HTMLFormElement>;
+    input: string;
     attachments?: Attachment[];
     forceWebSearch?: boolean;
   } | null>(null);
@@ -180,17 +218,28 @@ export const Chat = ({
   >(null);
   const lastUserMessageIdRef = useRef<string | null>(null);
   const hasScrolledToBottomOnLoadRef = useRef(false);
+  // Conversation the chat instance currently holds messages for, so a real
+  // switch (A -> B) can be told apart from the other reasons the effect below
+  // re-runs.
+  const loadedConversationIdRef = useRef(initialConversationId);
   const lastSubmissionRef = useRef<{
     input: string;
     files: FileList | null;
-    event: FormEvent<HTMLFormElement>;
-    options?: Record<string, unknown>;
   } | null>(null);
+  // Whether anything has been sent into the conversation currently loaded. Once
+  // it has, the client is authoritative and a fetched snapshot must not replace
+  // it. Reset when the conversation changes, below.
+  const hasSentRef = useRef(false);
+  // The history fetch currently in flight, so a submission can wait for it
+  // instead of racing it. Never rejects: fetchInitialMessages catches.
+  const historyFetchRef = useRef<Promise<void> | null>(null);
+  // Held while a submission is on its way to a send. Until that send starts the
+  // status stays `ready`, so the composer still accepts Enter.
+  const submitLockRef = useRef(false);
 
   const { mutate: createChatConversation } = useCreateChatConversation();
   const queryClient = useQueryClient();
   const [isReadingInstructions, setIsReadingInstructions] = useState(false);
-  const [contextTrimmed, setContextTrimmed] = useState(false);
   const readingInstructionsStartRef = useRef<number>(0);
   const aprilFools = useAprilFools();
 
@@ -205,6 +254,30 @@ export const Chat = ({
     setHasProjectInstructions,
     clearPendingInput,
   } = usePendingChatStore();
+
+  // Surface a notice while the active project still has files being indexed:
+  // their content isn't searchable yet, so a message sent now gets an answer
+  // that ignores them. Sending stays allowed - the banner states the tradeoff
+  // and the user decides. `useProjectAttachments` polls until indexing settles.
+  const activeProjectId =
+    conversationProjectId ?? pendingProjectId ?? undefined;
+  const { data: projectAttachments } = useProjectAttachments(activeProjectId);
+  const isIndexingFiles =
+    projectAttachments?.some((a) => a.index_state === 'indexing') ?? false;
+
+  // Files whose last indexing attempt failed: they stay usable/downloadable but
+  // aren't searchable, so surface an aggregate notice with a retry action.
+  const failedIndexingIds = useMemo(
+    () =>
+      (projectAttachments ?? [])
+        .filter((a) => a.index_state === 'failed')
+        .map((a) => a.id),
+    [projectAttachments],
+  );
+  const reindexAttachment = useReindexProjectAttachment(activeProjectId ?? '');
+  const handleRetryFailedIndexing = useCallback(() => {
+    reindexAttachment.mutate(failedIndexingIds);
+  }, [failedIndexingIds, reindexAttachment]);
 
   const scrollToBottom = useCallback(() => {
     if (chatContainerRef.current) {
@@ -256,27 +329,45 @@ export const Chat = ({
     console.error('Chat error:', error);
   };
 
+  // The input lives here now: v5's useChat no longer owns it.
+  const [input, setInput] = useState('');
+  const handleInputChange = useCallback(
+    (event: ChangeEvent<HTMLTextAreaElement | HTMLInputElement>) =>
+      setInput(event.target.value),
+    [],
+  );
+
+  // Deliberately not memoized: the hook keeps the latest handler in a ref, so a
+  // fresh closure each render is what keeps `setMessages` pointing at the
+  // current conversation's chat.
+  const onImagesSkipped = (kind: ImagesSkippedEventKind) => {
+    if (kind === 'chat_notice') {
+      setImagesSkipped(true);
+    } else {
+      setMessages(stampImagesSkippedOnLatestUserMessage);
+    }
+  };
+
   const {
     messages,
-    input,
-    handleSubmit: baseHandleSubmit,
-    handleInputChange,
+    sendMessage,
     status,
     stop: stopChat,
     setMessages,
     cooldownUntil,
-    data,
   } = useChat({
-    id: conversationId,
-    initialMessages: initialConversationMessages,
+    // `useChat` rebuilds the chat whenever its id differs from the instance's,
+    // and an instance with no id gets a generated one - so `undefined` never
+    // matches and the new-chat screen would rebuild on every render.
+    id: conversationId ?? 'new',
+    messages: initialConversationMessages,
     api: apiUrl,
-    streamProtocol: streamProtocol,
-    sendExtraMessageFields: true,
     onError: onErrorChat,
+    onImagesSkipped,
   });
 
   const stopGeneration = async () => {
-    stopChat();
+    await stopChat();
 
     const response = await fetchAPI(`chats/${conversationId}/stop-streaming/`, {
       method: 'POST',
@@ -299,7 +390,8 @@ export const Chat = ({
   };
 
   const handleSubmitWrapper = (event: FormEvent<HTMLFormElement>) => {
-    void handleSubmit(event);
+    event.preventDefault();
+    void submitMessage();
   };
 
   const handleRetry = () => {
@@ -309,18 +401,19 @@ export const Chat = ({
 
     const { input: lastInput, files: lastFiles } = lastSubmissionRef.current;
 
-    const lastAssistantIndex = messages.findLastIndex(
-      (msg) => msg.role === 'assistant',
-    );
-    if (lastAssistantIndex !== -1) {
-      setMessages(messages.filter((_, index) => index !== lastAssistantIndex));
+    // Drop the whole failed turn - the last user message and anything the
+    // failed attempt produced after it - because the resubmit below adds the
+    // question back. Removing just the last assistant message deleted the
+    // *previous*, successful answer whenever the attempt failed before
+    // producing one, and left the question on screen twice.
+    const lastUserIndex = messages.findLastIndex((msg) => msg.role === 'user');
+    if (lastUserIndex !== -1) {
+      setMessages(messages.slice(0, lastUserIndex));
     }
 
     retryOriginalInputRef.current = input;
     retryOriginalFilesRef.current = files;
-    handleInputChange({
-      target: { value: lastInput },
-    } as ChangeEvent<HTMLTextAreaElement>);
+    setInput(lastInput);
     setFiles(lastFiles);
     setShouldRetry(true);
   };
@@ -330,21 +423,94 @@ export const Chat = ({
     messages.forEach((message) => {
       if (message.parts) {
         const sourceParts = message.parts.filter(
-          (part): part is SourceUIPart => part.type === 'source',
+          (part): part is SourceUrlUIPart => part.type === 'source-url',
         );
         sourceParts.forEach((part) => {
-          void prefetchMetadata(part.source.url);
+          void prefetchMetadata(part.url);
         });
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
-  const openSources = useCallback((messageId: string) => {
-    // Source-parts guard is handled at the call site (MessageItem only shows the button when sourceParts.length > 0),
-    // so we just toggle it here.
-    setIsSourceOpen((prev) => (prev === messageId ? null : messageId));
-  }, []);
+  const openSources = useCallback(
+    (messageId: string) => {
+      setIsSourceOpen((prev) => {
+        const next = prev === messageId ? null : messageId;
+        setSourcesPanelOpen(next !== null);
+        return next;
+      });
+    },
+    [setSourcesPanelOpen],
+  );
+
+  useEffect(() => {
+    setIsSourceOpen(null);
+    setSourcesPanelOpen(false);
+  }, [initialConversationId, setSourcesPanelOpen]);
+
+  const selectedSourceParts = useMemo(() => {
+    if (!isSourceOpen) {
+      return [];
+    }
+    const sourceMessage = messages.find(
+      (message) => message.id === isSourceOpen,
+    );
+    if (!sourceMessage?.parts) {
+      return [];
+    }
+    return sourceMessage.parts.filter(
+      (part): part is SourceUrlUIPart => part.type === 'source-url',
+    );
+  }, [isSourceOpen, messages]);
+
+  const isSourcesPanelOpen =
+    Boolean(isSourceOpen) && selectedSourceParts.length > 0;
+
+  const sourcesPanelContent = isSourcesPanelOpen ? (
+    <Box
+      $direction="column"
+      $height="100%"
+      $css={`
+          background: var(--c--contextuals--background--surface--secondary);
+          border-left: 1px solid
+            var(--c--contextuals--border--surface--primary);
+          overflow-y: auto;
+          ${!isDesktop ? 'border-left: none;' : ''}
+        `}
+    >
+      <Box
+        $direction="row"
+        $justify="space-between"
+        $align="center"
+        $margin={{ all: 'xs', left: 'sm' }}
+      >
+        <Text as="h2" $size="lg" $weight="700">
+          {selectedSourceParts.length}{' '}
+          {selectedSourceParts.length > 1 ? t('Sources') : t('Source')}
+        </Text>
+        <Button
+          color="neutral"
+          variant="tertiary"
+          onClick={() => {
+            setIsSourceOpen(null);
+            setSourcesPanelOpen(false);
+          }}
+          aria-label={t('Close sources panel')}
+          icon={
+            <Icon
+              iconName="close"
+              $theme="neutral"
+              $variation="550"
+              $size="18px"
+            />
+          }
+        />
+      </Box>
+      <HorizontalSeparator $withPadding={false} />
+      <SourceItemList parts={selectedSourceParts} getMetadata={getMetadata} />
+    </Box>
+  ) : null;
 
   // Memoize the last assistant message index to avoid recalculating in render
   const lastAssistantMessageIndex = useMemo(() => {
@@ -400,15 +566,15 @@ export const Chat = ({
     const lastAssistant = messages.filter((m) => m.role === 'assistant').pop();
     if (!lastAssistant?.parts) return;
     if (lastAssistant.id === lastResumeErrorMessageIdRef.current) return;
-    const resumePart = lastAssistant.parts.find(
-      (p) =>
-        p.type === 'tool-invocation' &&
-        p.toolInvocation.toolName === 'conversation_resume' &&
-        p.toolInvocation.state === 'result',
-    );
-    if (!resumePart || resumePart.type !== 'tool-invocation') return;
-    if (resumePart.toolInvocation.state !== 'result') return;
-    const result = resumePart.toolInvocation.result as {
+    const resumePart = lastAssistant.parts
+      .filter(isToolUIPart)
+      .find(
+        (p) =>
+          getToolName(p) === 'conversation_resume' &&
+          p.state === 'output-available',
+      );
+    if (!resumePart) return;
+    const result = resumePart.output as {
       state: string;
       kind?: string;
       failed_documents?: string[];
@@ -531,12 +697,13 @@ export const Chat = ({
   // Scroll to bottom when conversation_resume tool appears so the illustration is fully visible
   useEffect(() => {
     const lastAssistant = messages.filter((m) => m.role === 'assistant').pop();
-    const hasResumeTool = lastAssistant?.parts?.some(
-      (p) =>
-        p.type === 'tool-invocation' &&
-        p.toolInvocation.toolName === 'conversation_resume' &&
-        p.toolInvocation.state !== 'result',
-    );
+    const hasResumeTool = lastAssistant?.parts
+      .filter(isToolUIPart)
+      .some(
+        (p) =>
+          getToolName(p) === 'conversation_resume' &&
+          p.state !== 'output-available',
+      );
     if (hasResumeTool && chatContainerRef.current) {
       requestAnimationFrame(() => {
         if (chatContainerRef.current) {
@@ -554,12 +721,9 @@ export const Chat = ({
     setConversationId(initialConversationId);
     // Reset input when conversation changes
     if (initialConversationId !== conversationId) {
-      handleInputChange({
-        target: { value: '' },
-      } as ChangeEvent<HTMLTextAreaElement>);
+      setInput('');
       setHasInitialized(false); // Réinitialiser pour permettre le scroll au prochain chargement
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialConversationId, conversationId]);
 
   // On mount, if there is pending input/files, initialize state and set flag
@@ -573,10 +737,7 @@ export const Chat = ({
         setIsReadingInstructions(true);
       }
       if (pendingInput) {
-        const syntheticEvent = {
-          target: { value: pendingInput },
-        } as ChangeEvent<HTMLInputElement>;
-        handleInputChange(syntheticEvent);
+        setInput(pendingInput);
       }
       if (pendingFiles) {
         setFiles(pendingFiles);
@@ -591,13 +752,7 @@ export const Chat = ({
   // When shouldAutoSubmit is set, and input/files are ready, submit
   useEffect(() => {
     if (shouldAutoSubmit && (input.trim() || (files && files.length > 0))) {
-      // Create a synthetic event for form submission
-      const form = document.createElement('form');
-      const syntheticFormEvent = {
-        preventDefault: () => {},
-        target: form,
-      } as unknown as FormEvent<HTMLFormElement>;
-      void handleSubmit(syntheticFormEvent);
+      void submitMessage();
       setShouldAutoSubmit(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -609,12 +764,9 @@ export const Chat = ({
       lastSubmissionRef.current &&
       input === lastSubmissionRef.current.input
     ) {
-      const { event } = lastSubmissionRef.current;
-
-      void handleSubmit(event);
-      handleInputChange({
-        target: { value: retryOriginalInputRef.current },
-      } as ChangeEvent<HTMLTextAreaElement>);
+      void submitMessage();
+      // Restore what the user had typed before the retry took over the input.
+      setInput(retryOriginalInputRef.current);
       setFiles(retryOriginalFilesRef.current);
 
       setShouldRetry(false);
@@ -622,20 +774,41 @@ export const Chat = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldRetry, input, files]);
 
-  useEffect(() => {
-    setContextTrimmed(false);
-  }, [conversationId]);
-
-  useEffect(() => {
-    if (!data || !Array.isArray(data)) return;
-    if (data.some(isContextTrimmedEvent)) {
-      setContextTrimmed(true);
-    }
-  }, [data]);
-
   // Fetch initial conversation messages if initialConversationId is provided and no pending input
   useEffect(() => {
     hasScrolledToBottomOnLoadRef.current = false; // Réinitialiser au début du chargement
+    // Navigating between two conversations reuses this component (the route
+    // carries no key) and rebuilds the chat instance as soon as the id
+    // changes - before the fetch below resolves. Drop the previous messages
+    // first, otherwise they are shown under the new conversation and, if the
+    // user submits in that window, posted to its endpoint.
+    if (loadedConversationIdRef.current !== initialConversationId) {
+      loadedConversationIdRef.current = initialConversationId;
+      hasSentRef.current = false;
+      setInitialConversationMessages(undefined);
+      setMessages([]);
+    }
+    setImagesSkipped(false);
+    // Drop the previous conversation's project so its indexing gate can't leak
+    // into this one; the getConversation() success below repopulates it. Skip
+    // the reset while a pending first message is creating this conversation: the
+    // fetch is skipped in that window, so onSuccess is the only setter and the
+    // reset would wipe the project it just assigned.
+    if (!(initialConversationId && pendingInput)) {
+      setConversationProjectId(null);
+    }
+    let dismissedFromStorage = false;
+    if (initialConversationId && typeof window !== 'undefined') {
+      try {
+        dismissedFromStorage =
+          window.localStorage.getItem(
+            imagesBannerStorageKey(initialConversationId),
+          ) === '1';
+      } catch {
+        // localStorage unavailable (privacy mode, sandboxed iframe, etc.) — treat as not dismissed.
+      }
+    }
+    setImagesBannerDismissed(dismissedFromStorage);
     let ignore = false;
     async function fetchInitialMessages() {
       if (initialConversationId && !pendingInput) {
@@ -644,24 +817,60 @@ export const Chat = ({
             id: initialConversationId,
           });
           if (!ignore) {
+            // v5 keeps the messages inside the chat instance, which was built
+            // when the id changed — before this fetch resolved.
             setInitialConversationMessages(conversation.messages);
+            // The server snapshot is only ever the *initial* state. This effect
+            // also re-runs when `pendingInput` clears at the end of the
+            // new-conversation handoff, and back then the message that was just
+            // sent is not persisted yet: applying the snapshot there wiped the
+            // user's question until the next reload. Keying on the send rather
+            // than on the message list keeps that true no matter which of the
+            // two lands first.
+            if (!hasSentRef.current) {
+              setMessages(conversation.messages);
+            }
+            setImagesSkipped(conversation.images_skipped ?? false);
+            setConversationProjectId(conversation.project?.id ?? null);
             setHasInitialized(true);
           }
         } catch {
           // Optionally handle error (e.g., setInitialConversationMessages([]) or show error)
           if (!ignore) {
             setInitialConversationMessages([]);
+            // Same rule as the success branch above: a failed refetch must not
+            // clear a conversation the client has already sent into.
+            if (!hasSentRef.current) {
+              setMessages([]);
+            }
             setHasInitialized(true);
           }
         }
       }
     }
-    void fetchInitialMessages();
+    historyFetchRef.current = fetchInitialMessages();
     return () => {
       ignore = true;
     };
     // Only run when initialConversationId or pendingInput changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialConversationId, pendingInput]);
+
+  const dismissImagesBanner = useCallback(() => {
+    setImagesBannerDismissed(true);
+    if (typeof window !== 'undefined' && conversationId) {
+      try {
+        window.localStorage.setItem(
+          imagesBannerStorageKey(conversationId),
+          '1',
+        );
+      } catch {
+        // localStorage unavailable — in-memory dismissal still holds for this session.
+      }
+    }
+  }, [conversationId]);
+
+  const showImagesBanner = imagesSkipped && !imagesBannerDismissed;
 
   useEffect(() => {
     if (
@@ -697,17 +906,46 @@ export const Chat = ({
     return !!project?.llm_instructions?.trim();
   }, [pendingProjectId, queryClient]);
 
-  // Custom handleSubmit to include attachments and handle chat creation
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  const toFileParts = (attachments: Attachment[]): FileUIPart[] =>
+    attachments.map((attachment) => ({
+      type: 'file',
+      url: attachment.url,
+      mediaType: attachment.contentType ?? 'application/octet-stream',
+      filename: attachment.name,
+    }));
 
+  const send = (text: string, attachments: Attachment[]) => {
+    hasSentRef.current = true;
+    void sendMessage({ text, files: toFileParts(attachments) });
+    setInput('');
+  };
+
+  // Custom submit to include attachments and handle chat creation
+  const submitMessage = async () => {
+    if (submitLockRef.current) {
+      return;
+    }
+    submitLockRef.current = true;
+    try {
+      // Sending before the history lands would leave the fetched messages
+      // unapplied: the snapshot below is only taken as initial state, and the
+      // conversation would look empty apart from this new exchange. Two
+      // submissions would otherwise wait here and resume on the same input.
+      await historyFetchRef.current;
+      await runSubmit();
+    } finally {
+      submitLockRef.current = false;
+    }
+  };
+
+  const runSubmit = async () => {
     // Inference-load cooldown: block new messages until the wait elapses.
     if (cooldownUntil && Date.now() < cooldownUntil) {
       return;
     }
 
     // April Fools' prank on the very first message of a new conversation.
-    // Use triggerDeferred so the prank survives the router.push() remount.
+    // Use triggerDeferred so the prank survives the navigate() remount.
     if (messages.length === 0) {
       aprilFools.triggerDeferred();
     }
@@ -742,8 +980,8 @@ export const Chat = ({
     }
 
     if (!conversationId) {
-      // Save the event and files, then create the chat
-      setPendingFirstMessage({ event, attachments, forceWebSearch });
+      // Save the message and files, then create the chat
+      setPendingFirstMessage({ input, attachments, forceWebSearch });
       // Save input and files to Zustand store before navigation
       setPendingChat(input, files);
       if (checkProjectHasInstructions()) {
@@ -756,28 +994,22 @@ export const Chat = ({
         },
         {
           onSuccess: (data) => {
+            // Carry the project onto the just-created conversation so its
+            // indexing banner/gate keep showing after we clear pendingProjectId
+            // below (the getConversation refetch that normally repopulates this
+            // is skipped while the pending first message is in flight).
+            setConversationProjectId(pendingProjectId ?? null);
             setProjectId(null);
             setConversationId(data.id);
-            // Update the URL to /chat/[id]/
-            void router.push(`/chat/${data.id}/`);
+            // Update the URL to /chat/<id>
+            void navigate(`/chat/${data.id}`);
             // After setting the conversationId, submit the pending message
             setTimeout(() => {
               if (pendingFirstMessage) {
-                // Prepare options with attachments
-                const options: Record<string, unknown> = {};
-                if (
-                  pendingFirstMessage.attachments &&
-                  pendingFirstMessage.attachments.length > 0
-                ) {
-                  options.experimental_attachments =
-                    pendingFirstMessage.attachments;
-                }
-
-                if (Object.keys(options).length > 0) {
-                  baseHandleSubmit(pendingFirstMessage.event, options);
-                } else {
-                  baseHandleSubmit(pendingFirstMessage.event);
-                }
+                send(
+                  pendingFirstMessage.input,
+                  pendingFirstMessage.attachments ?? [],
+                );
                 setFiles(null);
                 if (fileInputRef.current) {
                   fileInputRef.current.value = '';
@@ -786,30 +1018,39 @@ export const Chat = ({
               }
             }, 0);
           },
+          onError: (error) => {
+            // The pending store was primed for a navigation that is not going
+            // to happen. It has to be cleared: the mount effect above submits
+            // whatever it finds there, so leaving the message behind would
+            // auto-send it into the next conversation the user opens. The
+            // composer still holds the text (this path returns before the
+            // message is handed over), so trying again just works.
+            clearPendingInput();
+            setPendingFirstMessage(null);
+            setChatErrorModal({
+              title: isRateLimitError(error)
+                ? t('Too many conversations')
+                : t('Error'),
+              message: (
+                <Text>
+                  {isRateLimitError(error)
+                    ? rateLimitMessage(error, t)
+                    : t(
+                        'Failed to start a new conversation. Please try again.',
+                      )}
+                </Text>
+              ),
+            });
+          },
         },
       );
       return;
     }
 
-    // Prepare options with attachments
-    const options: Record<string, unknown> = {};
-    if (attachments.length > 0) {
-      options.experimental_attachments = attachments;
-    }
-
     setChatErrorType('generic');
-    lastSubmissionRef.current = {
-      input,
-      files,
-      event,
-      options: Object.keys(options).length > 0 ? options : undefined,
-    };
+    lastSubmissionRef.current = { input, files };
 
-    if (Object.keys(options).length > 0) {
-      baseHandleSubmit(event, options);
-    } else {
-      baseHandleSubmit(event);
-    }
+    send(input, attachments);
     // Attendre un peu avant de vider les fichiers pour s'assurer qu'ils sont traités
     setTimeout(() => {
       setFiles(null);
@@ -828,6 +1069,7 @@ export const Chat = ({
           height: 100%;
           flex-grow: 1;
           z-index: 1;
+          position: relative;
         `}
     >
       <Box
@@ -868,12 +1110,13 @@ export const Chat = ({
                       isFirstConversationMessage={isFirstConversationMessage}
                       streamingMessageHeight={streamingMessageHeight}
                       status={status}
+                      chatErrorType={chatErrorType}
+                      onRetry={handleRetry}
                       conversationId={conversationId}
                       isSourceOpen={isSourceOpen}
                       isMobile={isMobile}
                       onCopyToClipboard={copyToClipboard}
                       onOpenSources={openSources}
-                      getMetadata={getMetadata}
                     />
                   )}
                   {/* Inject the prank right after the last user message */}
@@ -902,21 +1145,6 @@ export const Chat = ({
             })}
           </Box>
         )}
-        {contextTrimmed && (
-          <Box
-            $direction="row"
-            $align="center"
-            $gap="6px"
-            $width="100%"
-            $maxWidth="var(--chat-content-max-width, 750px)"
-            $margin={{ all: 'auto' }}
-            $padding={{ left: '13px', top: 'xs', bottom: 'xs' }}
-          >
-            <Text $theme="neutral" $variation="tertiary" $size="sm">
-              {t("Some older messages are no longer in the model's context.")}
-            </Text>
-          </Box>
-        )}
         {!aprilFools.isActive &&
         ((status !== 'ready' && status !== 'streaming' && status !== 'error') ||
           isUploadingFiles) ? (
@@ -943,13 +1171,15 @@ export const Chat = ({
             </Text>
           </Box>
         ) : null}
-        {status === 'error' && !isUploadingFiles && (
-          <ChatError
-            errorType={chatErrorType}
-            hasLastSubmission={!!lastSubmissionRef.current}
-            onRetry={handleRetry}
-          />
-        )}
+        {status === 'error' &&
+          !isUploadingFiles &&
+          chatErrorType !== 'summarization_failed' && (
+            <ChatError
+              errorType={chatErrorType}
+              hasLastSubmission={!!lastSubmissionRef.current}
+              onRetry={handleRetry}
+            />
+          )}
       </Box>
       <Box
         $css={`
@@ -959,11 +1189,14 @@ export const Chat = ({
           background-color: var(--c--contextuals--background--surface--secondary);
           z-index: 1000;
         `}
-        $gap="6px"
+        $gap="0"
         $height="auto"
         $width="100%"
         $margin={{ all: 'auto', top: 'base' }}
       >
+        {showImagesBanner && (
+          <ImageProcessingUnavailableBanner onDismiss={dismissImagesBanner} />
+        )}
         <InputChat
           messagesLength={messages.length}
           input={input}
@@ -980,6 +1213,10 @@ export const Chat = ({
           selectedModel={selectedModel}
           onModelSelect={handleModelSelect}
           isUploadingFiles={isUploadingFiles}
+          isIndexingFiles={isIndexingFiles}
+          failedIndexingCount={failedIndexingIds.length}
+          onRetryFailedIndexing={handleRetryFailedIndexing}
+          isRetryingIndexing={reindexAttachment.isPending}
           errorType={status === 'error' ? chatErrorType : undefined}
           cooldownUntil={cooldownUntil}
         />
@@ -997,6 +1234,9 @@ export const Chat = ({
       >
         {chatErrorModal?.message}
       </Modal>
+      {sourcesPanelContent &&
+        sourcesPanelAnchorEl &&
+        createPortal(sourcesPanelContent, sourcesPanelAnchorEl)}
     </Box>
   );
 };

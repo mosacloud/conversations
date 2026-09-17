@@ -4,8 +4,8 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-import requests
 from pypdf import PdfReader
 
 from chat.agent_rag.document_converter.odt import OdtParsingError
@@ -52,13 +52,11 @@ OCR_MAX_RETRIES = 3
 def ai_settings(settings):
     """Mock Django settings for OCR configuration."""
     settings.MIN_AVG_CHARS_FOR_TEXT_EXTRACTION = MIN_AVG_CHARS_FOR_TEXT_EXTRACTION
-    settings.MIN_TEXT_COVERAGE_FOR_TEXT_EXTRACTION = 0.7
     settings.OCR_HRID = "test-ocr-hrid"
     settings.OCR_MODEL = "test-ocr-model"
     settings.OCR_TIMEOUT = 60
     settings.OCR_MAX_RETRIES = OCR_MAX_RETRIES
     settings.OCR_RETRY_DELAY = OCR_RETRY_DELAY
-    settings.OCR_BATCH_PAGES = 10
     settings.LLM_CONFIGURATIONS = {
         "test-ocr-hrid": MagicMock(
             provider=MagicMock(
@@ -150,7 +148,7 @@ def test_ocr_page_batch_success(text_pdf_1_page):
     """Should return markdown content on successful OCR."""
     parser = AdaptivePdfParser()
 
-    with patch("chat.agent_rag.document_converter.parser.requests.post") as mock_post:
+    with patch("chat.agent_rag.document_converter.parser.httpx.post") as mock_post:
         mock_post.return_value.json.return_value = {
             "pages": [
                 {"markdown": "# Page 1 content"},
@@ -168,10 +166,10 @@ def test_ocr_page_batch_retry_on_timeout(text_pdf_1_page):
     """Should retry on timeout with static delay."""
     parser = AdaptivePdfParser()
 
-    with patch("chat.agent_rag.document_converter.parser.requests.post") as mock_post:
+    with patch("chat.agent_rag.document_converter.parser.httpx.post") as mock_post:
         with patch("chat.agent_rag.document_converter.parser.time.sleep") as mock_sleep:
             mock_post.side_effect = [
-                requests.Timeout("Connection timed out"),
+                httpx.TimeoutException("Connection timed out"),
                 MagicMock(
                     json=MagicMock(return_value={"pages": [{"markdown": "# Content"}]}),
                     raise_for_status=MagicMock(),
@@ -189,11 +187,11 @@ def test_ocr_page_batch_fails_after_max_retries(text_pdf_1_page):
     """Should raise exception after max retries exceeded."""
     parser = AdaptivePdfParser()
 
-    with patch("chat.agent_rag.document_converter.parser.requests.post") as mock_post:
+    with patch("chat.agent_rag.document_converter.parser.httpx.post") as mock_post:
         with patch("chat.agent_rag.document_converter.parser.time.sleep"):
-            mock_post.side_effect = requests.Timeout("Connection timed out")
+            mock_post.side_effect = httpx.TimeoutException("Connection timed out")
 
-            with pytest.raises(requests.Timeout):
+            with pytest.raises(httpx.TimeoutException):
                 parser.ocr_page_batch("test.pdf", text_pdf_1_page, 0, 1)
 
             assert mock_post.call_count == OCR_MAX_RETRIES
@@ -203,11 +201,11 @@ def test_ocr_page_batch_retry_on_request_exception(text_pdf_1_page):
     """Should retry on general request exceptions."""
     parser = AdaptivePdfParser()
 
-    with patch("chat.agent_rag.document_converter.parser.requests.post") as mock_post:
+    with patch("chat.agent_rag.document_converter.parser.httpx.post") as mock_post:
         with patch("chat.agent_rag.document_converter.parser.time.sleep"):
             mock_post.side_effect = [
-                requests.RequestException("Network error"),
-                requests.RequestException("Network error"),
+                httpx.HTTPError("Network error"),
+                httpx.HTTPError("Network error"),
                 MagicMock(
                     json=MagicMock(return_value={"pages": [{"markdown": "# Content"}]}),
                     raise_for_status=MagicMock(),
@@ -224,7 +222,7 @@ def test_parse_pdf_with_ocr_single_batch(text_pdf_10_pages):
     """Should process PDF in single batch when pages <= batch size."""
     parser = AdaptivePdfParser()
 
-    with patch("chat.agent_rag.document_converter.parser.requests.post") as mock_post:
+    with patch("chat.agent_rag.document_converter.parser.httpx.post") as mock_post:
         mock_post.return_value.json.return_value = {
             "pages": [{"markdown": f"Page {i}"} for i in range(1, 11)]
         }
@@ -242,7 +240,7 @@ def test_parse_pdf_with_ocr_multiple_batches(text_pdf_10_pages, settings):
     settings.OCR_BATCH_PAGES = 4  # Force multiple batches
     parser = AdaptivePdfParser()
 
-    with patch("chat.agent_rag.document_converter.parser.requests.post") as mock_post:
+    with patch("chat.agent_rag.document_converter.parser.httpx.post") as mock_post:
         mock_post.return_value.json.side_effect = [
             {"pages": [{"markdown": f"Page {i}"} for i in range(1, 5)]},
             {"pages": [{"markdown": f"Page {i}"} for i in range(5, 9)]},
@@ -266,17 +264,17 @@ def test_parse_pdf_with_ocr_partial_failure(text_pdf_10_pages, settings):
     success_response.json.return_value = {"pages": [{"markdown": f"Page {i}"} for i in range(1, 5)]}
     success_response.raise_for_status = MagicMock()
 
-    with patch("chat.agent_rag.document_converter.parser.requests.post") as mock_post:
+    with patch("chat.agent_rag.document_converter.parser.httpx.post") as mock_post:
         with patch("chat.agent_rag.document_converter.parser.time.sleep"):
             # First batch succeeds, then all retries fail for remaining batches
             mock_post.side_effect = [
                 success_response,
-                requests.Timeout("OCR failed"),
-                requests.Timeout("OCR failed"),
-                requests.Timeout("OCR failed"),
-                requests.Timeout("OCR failed"),
-                requests.Timeout("OCR failed"),
-                requests.Timeout("OCR failed"),
+                httpx.TimeoutException("OCR failed"),
+                httpx.TimeoutException("OCR failed"),
+                httpx.TimeoutException("OCR failed"),
+                httpx.TimeoutException("OCR failed"),
+                httpx.TimeoutException("OCR failed"),
+                httpx.TimeoutException("OCR failed"),
             ]
 
             result = parser.parse_pdf_document_with_ocr("test.pdf", text_pdf_10_pages)

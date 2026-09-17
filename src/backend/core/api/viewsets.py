@@ -140,7 +140,6 @@ class ConfigView(drf.views.APIView):
             Return a dictionary of public settings.
         """
         array_settings = [
-            "ACTIVATION_REQUIRED",
             "STATUS_PAGE_URL",
             "ENVIRONMENT",
             "FRONTEND_CSS_URL",
@@ -174,6 +173,9 @@ class ConfigView(drf.views.APIView):
 
         dict_settings["status_banner"] = self._get_banner()
         dict_settings["maintenance"] = self._get_maintenance()
+
+        # Expose Docs integration URL so the frontend can show/hide the "Edit in Docs" button
+        dict_settings["DOCS_BASE_URL"] = settings.DOCS_BASE_URL
 
         return drf.response.Response(dict_settings)
 

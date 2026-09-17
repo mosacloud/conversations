@@ -48,7 +48,10 @@ describe('useAssistantHealth', () => {
     await waitFor(() => expect(result.current.data).toBeDefined());
 
     // fail-open: queryFn catches the error and returns FALLBACK
-    expect(result.current.data).toEqual({ banners: [], blocked: false });
+    expect(result.current.data).toEqual({
+      banners: [],
+      blocked: false,
+    });
   });
 
   it('returns empty banners and blocked=false on malformed JSON', async () => {
@@ -65,7 +68,10 @@ describe('useAssistantHealth', () => {
     await waitFor(() => expect(result.current.data).toBeDefined());
 
     // fail-open: JSON parse error is caught and falls back to FALLBACK
-    expect(result.current.data).toEqual({ banners: [], blocked: false });
+    expect(result.current.data).toEqual({
+      banners: [],
+      blocked: false,
+    });
   });
 
   it('returns blocked=true when API signals blocked', async () => {
@@ -89,7 +95,7 @@ describe('useAssistantHealth', () => {
   });
 
   it('polls the endpoint every 60 seconds', async () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
 
     fetchMock.get(`${API_BASE}assistant-health/`, {
       status: 200,
@@ -100,23 +106,23 @@ describe('useAssistantHealth', () => {
       wrapper: AppWrapper,
     });
 
+    // `waitFor` cannot be used while the clock is faked: testing-library only
+    // detects Jest's clock, so its internal polling never advances and it
+    // hangs. Drive the timers explicitly instead.
     await act(async () => {
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
     });
-    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data).toBeDefined();
 
     const callsBefore = fetchMock.calls().length;
     expect(callsBefore).toBeGreaterThanOrEqual(1);
 
     await act(async () => {
-      jest.advanceTimersByTime(60_000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(60_000);
     });
 
-    await waitFor(() =>
-      expect(fetchMock.calls().length).toBeGreaterThan(callsBefore),
-    );
+    expect(fetchMock.calls().length).toBeGreaterThan(callsBefore);
 
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 });

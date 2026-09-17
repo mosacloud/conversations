@@ -1,10 +1,13 @@
 """Tests for BaseParser and AlbertParser."""
 
+import base64
+import json
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
-import responses
+import respx
 
 from chat.agent_rag.document_converter.parser import (
     AlbertParser,
@@ -15,7 +18,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 ALBERT_API_URL = "https://albert.api.etalab.gouv.fr"
 ALBERT_API_KEY = "test-key"
-ALBERT_PARSE_ENDPOINT = f"{ALBERT_API_URL}/v1/parse-beta"
+ALBERT_PARSE_ENDPOINT = f"{ALBERT_API_URL}/v1/ocr"
 
 
 @pytest.fixture(name="sample_odt")
@@ -42,20 +45,21 @@ def test_base_parser_cannot_be_instantiated():
         BaseParser()  # pylint: disable=abstract-class-instantiated
 
 
-@responses.activate
-def test_albert_parser_pdf_success():
-    """AlbertParser should call Albert API and join page contents."""
-    responses.add(
-        responses.POST,
-        ALBERT_PARSE_ENDPOINT,
-        json={
-            "data": [
-                {"content": "# Page 1"},
-                {"content": "## Page 2"},
-                {"content": "End."},
-            ]
-        },
-        status=200,
+@respx.mock
+def test_albert_parser_pdf_success(settings):
+    """AlbertParser should call Albert's OCR endpoint and join page markdown."""
+    settings.OCR_MODEL = "test-ocr-model"
+    respx.post(ALBERT_PARSE_ENDPOINT).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "pages": [
+                    {"markdown": "# Page 1"},
+                    {"markdown": "## Page 2"},
+                    {"markdown": "End."},
+                ]
+            },
+        )
     )
 
     parser = AlbertParser()
@@ -63,18 +67,27 @@ def test_albert_parser_pdf_success():
     result = parser.parse_document("report.pdf", "application/pdf", b"pdf-bytes")
 
     assert result == "# Page 1\n\n## Page 2\n\nEnd."
-    assert len(responses.calls) == 1
-    assert responses.calls[0].request.url == ALBERT_PARSE_ENDPOINT
+    assert len(respx.calls) == 1
+    assert respx.calls[0].request.url == ALBERT_PARSE_ENDPOINT
+
+    # The OCR endpoint takes the document inline as a base64 data URL, not a file upload.
+    payload = json.loads(respx.calls[0].request.content)
+    encoded = base64.standard_b64encode(b"pdf-bytes").decode("utf-8")
+    assert payload == {
+        "document": {
+            "type": "document_url",
+            "document_name": "report.pdf",
+            "document_url": f"data:application/pdf;base64,{encoded}",
+        },
+        "model": "test-ocr-model",
+    }
 
 
-@responses.activate
+@respx.mock
 def test_albert_parser_pdf_http_error():
     """AlbertParser should propagate HTTP errors from Albert API."""
-    responses.add(
-        responses.POST,
-        ALBERT_PARSE_ENDPOINT,
-        json={"error": "Internal Server Error"},
-        status=500,
+    respx.post(ALBERT_PARSE_ENDPOINT).mock(
+        return_value=httpx.Response(500, json={"error": "Internal Server Error"})
     )
 
     parser = AlbertParser()

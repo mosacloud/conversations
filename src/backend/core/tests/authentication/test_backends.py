@@ -9,8 +9,10 @@ from django.core.exceptions import SuspiciousOperation
 from django.test.utils import override_settings
 from django.utils import timezone
 
+import httpx
 import pytest
 import responses
+import respx
 from cryptography.fernet import Fernet
 from lasuite.oidc_login.backends import get_oidc_refresh_token
 
@@ -153,7 +155,6 @@ def test_authentication_getter_existing_user_no_fallback_to_email_no_duplicate(
 
     # Set the setting to False
     settings.OIDC_FALLBACK_TO_EMAIL_FOR_IDENTIFICATION = False
-    settings.OIDC_ALLOW_DUPLICATE_EMAILS = False
 
     def get_userinfo_mocked(*args):
         return {"sub": "123", "email": db_user.email}
@@ -186,7 +187,6 @@ def test_authentication_getter_existing_user_no_fallback_to_email_no_duplicate_c
 
     # Set the setting to False
     settings.OIDC_FALLBACK_TO_EMAIL_FOR_IDENTIFICATION = False
-    settings.OIDC_ALLOW_DUPLICATE_EMAILS = False
 
     def get_userinfo_mocked(*args):
         return {"sub": "123", "email": "JOHN.DOE@EXAMPLE.COM"}
@@ -361,7 +361,6 @@ def test_authentication_getter_new_user_with_email(monkeypatch):
     assert models.User.objects.count() == 1
 
 
-@override_settings(OIDC_OP_USER_ENDPOINT="http://oidc.endpoint.test/userinfo")
 @responses.activate
 def test_authentication_get_userinfo_json_response():
     """Test get_userinfo method with a JSON response."""
@@ -385,7 +384,6 @@ def test_authentication_get_userinfo_json_response():
     assert result["email"] == "john.doe@example.com"
 
 
-@override_settings(OIDC_OP_USER_ENDPOINT="http://oidc.endpoint.test/userinfo")
 @responses.activate
 def test_authentication_get_userinfo_token_response(monkeypatch, settings):
     """Test get_userinfo method with a token response."""
@@ -415,7 +413,6 @@ def test_authentication_get_userinfo_token_response(monkeypatch, settings):
     assert result["email"] == "jane.doe@example.com"
 
 
-@override_settings(OIDC_OP_USER_ENDPOINT="http://oidc.endpoint.test/userinfo")
 @responses.activate
 def test_authentication_get_userinfo_invalid_response(settings):
     """
@@ -505,9 +502,6 @@ def test_authentication_session_tokens(django_assert_num_queries, monkeypatch, r
     """
     Test that the session contains oidc_refresh_token and oidc_access_token after authentication.
     """
-    settings.OIDC_OP_TOKEN_ENDPOINT = "http://oidc.endpoint.test/token"
-    settings.OIDC_OP_USER_ENDPOINT = "http://oidc.endpoint.test/userinfo"
-    settings.OIDC_OP_JWKS_ENDPOINT = "http://oidc.endpoint.test/jwks"
     settings.OIDC_STORE_ACCESS_TOKEN = True
     settings.OIDC_STORE_REFRESH_TOKEN = True
     settings.OIDC_STORE_REFRESH_TOKEN_KEY = Fernet.generate_key()
@@ -552,26 +546,21 @@ def test_authentication_session_tokens(django_assert_num_queries, monkeypatch, r
 
 
 @responses.activate
+@respx.mock
 def test_authentication_user_added_to_brevo(monkeypatch, rf, settings):
     """
     Test that a user is added to the Brevo follow-up list upon authentication.
     """
-    settings.OIDC_OP_TOKEN_ENDPOINT = "http://oidc.endpoint.test/token"
-    settings.OIDC_OP_USER_ENDPOINT = "http://oidc.endpoint.test/userinfo"
-    settings.OIDC_OP_JWKS_ENDPOINT = "http://oidc.endpoint.test/jwks"
 
     settings.BREVO_API_KEY = "test-api-key"
     settings.BREVO_FOLLOWUP_LIST_ID = "follow-up-list-id"
-    settings.ACTIVATION_REQUIRED = False
 
-    brevo_create_contact = responses.post(
-        "https://api.brevo.com/v3/contacts",
-        status=200,
+    brevo_create_contact = respx.post("https://api.brevo.com/v3/contacts").mock(
+        return_value=httpx.Response(200)
     )
-    brevo_add_to_list = responses.post(
-        "https://api.brevo.com/v3/contacts/lists/follow-up-list-id/contacts/add",
-        status=400,
-    )
+    brevo_add_to_list = respx.post(
+        "https://api.brevo.com/v3/contacts/lists/follow-up-list-id/contacts/add"
+    ).mock(return_value=httpx.Response(400))
 
     klass = OIDCAuthenticationBackend()
     request = rf.get("/some-url", {"state": "test-state", "code": "test-code"})
@@ -608,17 +597,16 @@ def test_authentication_user_added_to_brevo(monkeypatch, rf, settings):
 
     assert len(brevo_create_contact.calls) == 1
     assert brevo_create_contact.calls[0].request.headers["api-key"] == "test-api-key"
-    assert json.loads(brevo_create_contact.calls[0].request.body) == {
+    assert json.loads(brevo_create_contact.calls[0].request.content) == {
         "email": user.email,
         "updateEnabled": True,
     }
 
     assert len(brevo_add_to_list.calls) == 1
     assert brevo_add_to_list.calls[0].request.headers["api-key"] == "test-api-key"
-    assert json.loads(brevo_add_to_list.calls[0].request.body) == {"emails": [user.email]}
+    assert json.loads(brevo_add_to_list.calls[0].request.content) == {"emails": [user.email]}
 
-    # Now test when activation is required: user should not be added to Brevo list
-    settings.ACTIVATION_REQUIRED = True
+    # A returning user is already in the list: Brevo must not be called again
     klass.authenticate(
         request,
         code="test-code",
@@ -631,21 +619,39 @@ def test_authentication_user_added_to_brevo(monkeypatch, rf, settings):
 
 
 @responses.activate
+@respx.mock
+def test_post_get_or_create_user_only_syncs_new_users(settings):
+    """Only a freshly created user is pushed to the Brevo follow-up list."""
+
+    settings.BREVO_API_KEY = "test-api-key"
+    settings.BREVO_FOLLOWUP_LIST_ID = "follow-up-list-id"
+
+    respx.post("https://api.brevo.com/v3/contacts").mock(return_value=httpx.Response(201))
+    brevo_add_to_list = respx.post(
+        "https://api.brevo.com/v3/contacts/lists/follow-up-list-id/contacts/add"
+    ).mock(return_value=httpx.Response(201))
+
+    klass = OIDCAuthenticationBackend()
+    user = UserFactory()
+
+    klass.post_get_or_create_user(user, {}, is_new_user=False)
+    assert len(brevo_add_to_list.calls) == 0
+
+    klass.post_get_or_create_user(user, {}, is_new_user=True)
+    assert len(brevo_add_to_list.calls) == 1
+
+
+@responses.activate
+@respx.mock
 def test_authentication_user_not_added_to_brevo_without_list_id(monkeypatch, rf, settings):
     """
     Test that no Brevo call is made when BREVO_FOLLOWUP_LIST_ID is not configured.
     """
-    settings.OIDC_OP_TOKEN_ENDPOINT = "http://oidc.endpoint.test/token"
-    settings.OIDC_OP_USER_ENDPOINT = "http://oidc.endpoint.test/userinfo"
-    settings.OIDC_OP_JWKS_ENDPOINT = "http://oidc.endpoint.test/jwks"
 
     settings.BREVO_API_KEY = "test-api-key"
-    settings.BREVO_FOLLOWUP_LIST_ID = None
-    settings.ACTIVATION_REQUIRED = False
 
-    brevo_create_contact = responses.post(
-        "https://api.brevo.com/v3/contacts",
-        status=200,
+    brevo_create_contact = respx.post("https://api.brevo.com/v3/contacts").mock(
+        return_value=httpx.Response(200)
     )
 
     klass = OIDCAuthenticationBackend()
@@ -686,27 +692,22 @@ def test_authentication_user_not_added_to_brevo_without_list_id(monkeypatch, rf,
 
 
 @responses.activate
+@respx.mock
 def test_authentication_role_denied_user_not_added_to_brevo(monkeypatch, rf, settings):
     """
     Test that a user denied by the role gate is not added to the Brevo list.
     """
-    settings.OIDC_OP_TOKEN_ENDPOINT = "http://oidc.endpoint.test/token"
-    settings.OIDC_OP_USER_ENDPOINT = "http://oidc.endpoint.test/userinfo"
-    settings.OIDC_OP_JWKS_ENDPOINT = "http://oidc.endpoint.test/jwks"
 
     settings.BREVO_API_KEY = "test-api-key"
     settings.BREVO_FOLLOWUP_LIST_ID = "follow-up-list-id"
-    settings.ACTIVATION_REQUIRED = False
     settings.OIDC_ALLOWED_ROLES = ["agent_public_etat"]
 
-    brevo_create_contact = responses.post(
-        "https://api.brevo.com/v3/contacts",
-        status=200,
+    brevo_create_contact = respx.post("https://api.brevo.com/v3/contacts").mock(
+        return_value=httpx.Response(200)
     )
-    brevo_add_to_list = responses.post(
-        "https://api.brevo.com/v3/contacts/lists/follow-up-list-id/contacts/add",
-        status=200,
-    )
+    brevo_add_to_list = respx.post(
+        "https://api.brevo.com/v3/contacts/lists/follow-up-list-id/contacts/add"
+    ).mock(return_value=httpx.Response(200))
 
     klass = OIDCAuthenticationBackend()
     request = rf.get("/some-url", {"state": "test-state", "code": "test-code"})
@@ -746,7 +747,6 @@ def test_authentication_role_denied_user_not_added_to_brevo(monkeypatch, rf, set
     assert len(brevo_add_to_list.calls) == 0
 
 
-@override_settings(OIDC_ALLOWED_ROLES=[])
 def test_verify_claims_no_allowed_roles_setting_allows_any_user():
     """With OIDC_ALLOWED_ROLES empty, any user passing essential claims is allowed."""
     klass = OIDCAuthenticationBackend()

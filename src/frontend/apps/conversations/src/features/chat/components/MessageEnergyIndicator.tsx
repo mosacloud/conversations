@@ -1,0 +1,141 @@
+import {
+  Button,
+  Modal,
+  ModalSize,
+  Tooltip,
+  useModal,
+} from '@gouvfr-lasuite/cunningham-react';
+import { useCallback, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import ArrowUpRightIcon from '@/assets/icons/uikit-custom/arrow-up-right.svg?react';
+import LeavesIcon from '@/assets/icons/uikit-custom/leaves.svg?react';
+import { Box, Text } from '@/components';
+import { useCunninghamTheme } from '@/cunningham';
+import { useAnalytics } from '@/libs';
+import { useResponsiveStore } from '@/stores';
+
+import {
+  buildImpactCo2ComparateurUrl,
+  buildImpactCo2WidgetDataSearch,
+  mountImpactCo2Widget,
+} from '../utils/impactCo2';
+
+const formatCo2Impact = (kgCo2eq: number): string => {
+  const grams = kgCo2eq * 1000;
+  // Below 1 g, fixed fraction digits would round to "0"; keep 2 significant
+  // digits instead so low impacts stay visible (e.g. "0.0012 g CO₂eq").
+  const format: Intl.NumberFormatOptions =
+    grams < 1 ? { maximumSignificantDigits: 2 } : { maximumFractionDigits: 2 };
+  return `${grams.toLocaleString(undefined, format)} g CO₂eq`;
+};
+
+interface MessageEnergyIndicatorProps {
+  co2ImpactKg: number;
+}
+
+export const MessageEnergyIndicator = ({
+  co2ImpactKg,
+}: MessageEnergyIndicatorProps) => {
+  const { t, i18n } = useTranslation();
+  const { isMobile } = useResponsiveStore();
+  const theme = useCunninghamTheme((state) => state.theme);
+  const modal = useModal();
+  const { trackEvent } = useAnalytics();
+  const impactLabel = t('This request: {{co2}}', {
+    co2: formatCo2Impact(co2ImpactKg),
+  });
+  const ariaLabel = t('Carbon impact');
+
+  const comparateurUrl = useMemo(
+    () => buildImpactCo2ComparateurUrl(co2ImpactKg),
+    [co2ImpactKg],
+  );
+
+  const dataSearch = useMemo(() => {
+    const widgetTheme =
+      theme === 'dark' || theme === 'dsfr-dark' ? 'night' : 'default';
+    const language = i18n.resolvedLanguage?.startsWith('fr') ? 'fr' : 'en';
+    return buildImpactCo2WidgetDataSearch({
+      co2ImpactKg,
+      language,
+      theme: widgetTheme,
+    });
+  }, [co2ImpactKg, theme, i18n.resolvedLanguage]);
+
+  const widgetContainerRef = useCallback(
+    (container: HTMLDivElement | null) => {
+      if (!container) {
+        return;
+      }
+      mountImpactCo2Widget(container, dataSearch);
+    },
+    [dataSearch],
+  );
+
+  const handleOpen = () => {
+    trackEvent({
+      eventName: 'carbon_footprint_opened',
+      properties: { co2_impact_kg: co2ImpactKg },
+    });
+    modal.open();
+  };
+
+  const button = (
+    <Button
+      size="nano"
+      color="neutral"
+      variant="tertiary"
+      aria-label={ariaLabel}
+      data-testid="message-energy-indicator"
+      icon={<LeavesIcon width={14} height={14} aria-hidden />}
+      className="c__button--neutral action-chat-button"
+      onClick={handleOpen}
+    />
+  );
+
+  return (
+    <>
+      {isMobile ? (
+        button
+      ) : (
+        <Tooltip placement="top" content={impactLabel}>
+          {button}
+        </Tooltip>
+      )}
+      <Modal
+        closeOnClickOutside
+        {...modal}
+        title={ariaLabel}
+        size={ModalSize.MEDIUM}
+        leftActions={
+          <Button
+            color="neutral"
+            variant="bordered"
+            href={comparateurUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            icon={<ArrowUpRightIcon aria-hidden />}
+            iconPosition="right"
+          >
+            {t('Know more')}
+          </Button>
+        }
+        rightActions={
+          <Button color="brand" variant="primary" onClick={() => modal.close()}>
+            {t('OK')}
+          </Button>
+        }
+      >
+        <Box>
+          <Text>{impactLabel}</Text>
+          <div
+            ref={widgetContainerRef}
+            data-testid="impact-co2-widget"
+            style={{ width: '100%', minHeight: '120px' }}
+          />
+        </Box>
+      </Modal>
+    </>
+  );
+};

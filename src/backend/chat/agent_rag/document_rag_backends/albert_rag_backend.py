@@ -10,11 +10,11 @@ from django.conf import settings
 from django.utils.module_loading import import_string
 
 import httpx
-import requests
 
 from chat.agent_rag.albert_api_constants import Searches
 from chat.agent_rag.constants import RAGWebResult, RAGWebResults, RAGWebUsage
 from chat.agent_rag.document_rag_backends.base_rag_backend import BaseRagBackend
+from chat.constants import MARKDOWN_MIME_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class AlbertRagBackend(BaseRagBackend):  # pylint: disable=too-many-instance-att
         Create a temporary collection for the search operation.
         This method should handle the logic to create or retrieve an existing collection.
         """
-        response = requests.post(
+        response = httpx.post(
             self._collections_endpoint,
             headers=self._headers,
             json={
@@ -107,7 +107,7 @@ class AlbertRagBackend(BaseRagBackend):  # pylint: disable=too-many-instance-att
         """
         Delete the current collection
         """
-        response = requests.delete(
+        response = httpx.delete(
             urljoin(f"{self._collections_endpoint}/", self.collection_id),
             headers=self._headers,
             timeout=settings.ALBERT_API_TIMEOUT,
@@ -116,7 +116,7 @@ class AlbertRagBackend(BaseRagBackend):  # pylint: disable=too-many-instance-att
 
     def delete_document(self, document_id: str, **kwargs) -> None:
         """Remove a single document from Albert via DELETE /v1/documents/{id}."""
-        response = requests.delete(
+        response = httpx.delete(
             urljoin(f"{self._documents_endpoint}/", str(document_id)),
             headers=self._headers,
             timeout=settings.ALBERT_API_TIMEOUT,
@@ -149,13 +149,15 @@ class AlbertRagBackend(BaseRagBackend):  # pylint: disable=too-many-instance-att
             Optional[str]: The Albert document id, used later as a `document_ids`
             filter on `/v1/search` and as the target of `delete_document`.
         """
-        response = requests.post(
+        response = httpx.post(
             urljoin(self._base_url, self._documents_endpoint),
             headers=self._headers,
             files={
-                "file": (f"{name}.md", BytesIO(content.encode("utf-8")), "text/markdown"),
-                "collection": (None, int(self.collection_id)),
-                "metadata": (None, json.dumps({"document_name": name})),  # undocumented API
+                "file": (f"{name}.md", BytesIO(content.encode("utf-8")), MARKDOWN_MIME_TYPE),
+            },
+            data={
+                "collection_id": int(self.collection_id),
+                "metadata": json.dumps({"document_name": name}),  # undocumented API
             },
             timeout=settings.ALBERT_API_TIMEOUT,
         )
@@ -187,10 +189,10 @@ class AlbertRagBackend(BaseRagBackend):  # pylint: disable=too-many-instance-att
                 urljoin(self._base_url, self._documents_endpoint),
                 headers=self._headers,
                 files={
-                    "file": (f"{name}.md", BytesIO(content.encode("utf-8")), "text/markdown"),
+                    "file": (f"{name}.md", BytesIO(content.encode("utf-8")), MARKDOWN_MIME_TYPE),
                 },
                 data={
-                    "collection": int(self.collection_id),
+                    "collection_id": int(self.collection_id),
                     "metadata": json.dumps({"document_name": name}),  # undocumented API
                 },
                 timeout=settings.ALBERT_API_TIMEOUT,
@@ -217,14 +219,14 @@ class AlbertRagBackend(BaseRagBackend):  # pylint: disable=too-many-instance-att
         When `document_id` is provided, it is preferred over `document_name`:
         Albert's `document_ids` filter is collection-aware and unambiguous,
         whereas `metadata_filters: document_name` matches by name across every
-        collection in `collections` (which fails when conversation and project
+        collection in `collection_ids` (which fails when conversation and project
         each carry a doc with the same filename).
         """
         payload: dict = {
-            "collections": self.get_all_collection_ids(),  # might raise RuntimeError
-            "prompt": query,
+            "collection_ids": self.get_all_collection_ids(),  # might raise RuntimeError
+            "query": query,
             "score_threshold": 0.6,
-            "k": results_count,
+            "limit": results_count,
         }
         if document_id:
             payload["document_ids"] = [int(document_id)]
@@ -275,7 +277,7 @@ class AlbertRagBackend(BaseRagBackend):  # pylint: disable=too-many-instance-att
     ) -> RAGWebResults:
         """Perform a search using the Albert API based on the provided query."""
         payload = self._build_search_payload(query, results_count, document_name, document_id)
-        response = requests.post(
+        response = httpx.post(
             urljoin(self._base_url, self._search_endpoint),
             headers=self._headers,
             json=payload,

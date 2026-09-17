@@ -10,8 +10,9 @@ from unittest.mock import ANY
 from django.core.files.storage import default_storage
 from django.utils import formats, timezone
 
+import httpx
 import pytest
-import responses
+import respx
 from dirty_equals import IsUUID
 from freezegun import freeze_time
 from pydantic_ai import ModelRequest, RequestUsage
@@ -29,7 +30,7 @@ from core.file_upload.enums import AttachmentStatus
 
 from chat.agents.conversation import PREVENT_URL_HALLUCINATION_INSTRUCTION
 from chat.ai_sdk_types import (
-    Attachment,
+    FileUIPart,
     TextUIPart,
     UIMessage,
 )
@@ -121,21 +122,12 @@ def _assert_document_instructions(
     assert document["info"] == expected_info
 
 
-@pytest.fixture(
-    autouse=True,
-    params=[
-        "chat.agent_rag.document_rag_backends.find_rag_backend.FindRagBackend",
-        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend",
-    ],
-)
-def ai_settings(request, settings):
+@pytest.fixture(autouse=True)
+def ai_settings(settings):
     """Fixture to set AI service URLs for testing."""
-    settings.RAG_DOCUMENT_SEARCH_BACKEND = request.param
-    settings.AI_BASE_URL = "https://www.external-ai-service.com/"
-    settings.AI_API_KEY = "test-api-key"
-    settings.FIND_API_URL = "https://app-find"
-    settings.FIND_API_KEY = "find-api-key"
-    settings.AI_MODEL = "test-model"
+    settings.RAG_DOCUMENT_SEARCH_BACKEND = (
+        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend"
+    )
     settings.AI_AGENT_INSTRUCTIONS = "You are a helpful test assistant :)"
     return settings
 
@@ -151,7 +143,7 @@ def fixture_sample_document_content():
     )
 
 
-@responses.activate
+@respx.mock
 @freeze_time()
 def test_post_conversation_with_local_pdf_document_url(
     # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -164,25 +156,16 @@ def test_post_conversation_with_local_pdf_document_url(
     Test POST to /api/v1/chats/{pk}/conversation/ with a document URL.
     """
 
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/collections",
-        json={"id": 123, "object": "collection"},
-        status=200,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/collections").mock(
+        return_value=httpx.Response(200, json={"id": 123, "object": "collection"})
     )
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/parse-beta",
-        json={"id": "parse_id", "object": "document content"},
-        status=200,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/ocr").mock(
+        return_value=httpx.Response(200, json={"pages": [{"markdown": "document content"}]})
     )
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/documents",
-        json={"id": "document_id", "object": "document"},
-        status=200,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/documents").mock(
+        return_value=httpx.Response(200, json={"id": "document_id", "object": "document"})
     )
-    responses.post(
-        "https://app-find/api/v1.0/documents/index/",
-        status=200,
-    )
+    respx.post("https://app-find/api/v1.0/documents/index/").mock(return_value=httpx.Response(200))
 
     chat_conversation = ChatConversationFactory(owner__language="en-us")
     api_client.force_authenticate(user=chat_conversation.owner)
@@ -207,13 +190,9 @@ def test_post_conversation_with_local_pdf_document_url(
                 text="What is in this document?",
                 type="text",
             ),
-        ],
-        experimental_attachments=[
-            Attachment(
-                name="sample.pdf",
-                contentType="application/pdf",
-                url=document_url,
-            )
+            FileUIPart(
+                type="file", filename="sample.pdf", mediaType="application/pdf", url=document_url
+            ),
         ],
     )
 
@@ -239,7 +218,7 @@ def test_post_conversation_with_local_pdf_document_url(
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -249,13 +228,18 @@ def test_post_conversation_with_local_pdf_document_url(
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '9:{"toolCallId":"XXX","toolName":"document_parsing",'
-        '"args":{"documents":[{"identifier":"sample.pdf"}]}}\n'
-        'a:{"toolCallId":"XXX","result":{"state":"done"}}\n'
-        '0:"This is a document about a single pixel."\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":50,"completionTokens":9,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"XXX","toolName":"document_parsing'
+        '","input":{"documents":[{"identifier":"sample.pdf"}]}}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"XXX","output":{"state":"done"}}'
+        "\n\n"
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"This is a document about a single pixel'
+        '."}\n\n'
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":50,"completionToke'
+        'ns":9,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # Check that the conversation was updated
@@ -267,11 +251,8 @@ def test_post_conversation_with_local_pdf_document_url(
         id=chat_conversation.messages[0].id,
         createdAt=timezone.now(),
         content="What is in this document?",
-        reasoning=None,
         experimental_attachments=None,  # We should fix this, but for now document appears in source
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(type="text", text="What is in this document?"),
         ],
@@ -282,11 +263,7 @@ def test_post_conversation_with_local_pdf_document_url(
         id=chat_conversation.messages[1].id,
         createdAt=timezone.now(),
         content="This is a document about a single pixel.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(type="text", text="This is a document about a single pixel."),
         ],
@@ -314,6 +291,7 @@ def test_post_conversation_with_local_pdf_document_url(
                 },
             ],
             "run_id": _run_id,
+            "state": "complete",
             "timestamp": timestamp,
         },
         {
@@ -374,13 +352,9 @@ def test_post_conversation_with_local_document_wrong_url(
                 text="What is in this document?",
                 type="text",
             ),
-        ],
-        experimental_attachments=[
-            Attachment(
-                name="sample.pdf",
-                contentType="application/pdf",
-                url=document_url,
-            )
+            FileUIPart(
+                type="file", filename="sample.pdf", mediaType="application/pdf", url=document_url
+            ),
         ],
     )
 
@@ -397,7 +371,7 @@ def test_post_conversation_with_local_document_wrong_url(
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -407,13 +381,14 @@ def test_post_conversation_with_local_document_wrong_url(
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '9:{"toolCallId":"XXX","toolName":"document_parsing",'
-        '"args":{"documents":[{"identifier":"sample.pdf"}]}}\n'
-        'a:{"toolCallId":"XXX",'
-        '"result":{"state":"error","kind":"rag_error","error":"Document '
-        'URL does not belong to the conversation."}}\n'
-        'd:{"finishReason":"error","usage":{"promptTokens":0,"completionTokens":0,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"XXX","toolName":"document_parsing'
+        '","input":{"documents":[{"identifier":"sample.pdf"}]}}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"XXX","output":{"state":"error","'
+        'kind":"rag_error","error":"Document URL does not belong to the conversation."}}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionToken'
+        's":0,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # Check that the conversation was not updated
@@ -443,13 +418,9 @@ def test_post_conversation_with_remote_document_url(
                 text="What is in this document?",
                 type="text",
             ),
-        ],
-        experimental_attachments=[
-            Attachment(
-                name="sample.pdf",
-                contentType="application/pdf",
-                url=document_url,
-            )
+            FileUIPart(
+                type="file", filename="sample.pdf", mediaType="application/pdf", url=document_url
+            ),
         ],
     )
 
@@ -466,7 +437,7 @@ def test_post_conversation_with_remote_document_url(
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -476,13 +447,14 @@ def test_post_conversation_with_remote_document_url(
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '9:{"toolCallId":"XXX","toolName":"document_parsing",'
-        '"args":{"documents":[{"identifier":"sample.pdf"}]}}\n'
-        'a:{"toolCallId":"XXX",'
-        '"result":{"state":"error","kind":"rag_error","error":"External document '
-        'URL are not accepted yet."}}\n'
-        'd:{"finishReason":"error","usage":{"promptTokens":0,"completionTokens":0,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"XXX","toolName":"document_parsing'
+        '","input":{"documents":[{"identifier":"sample.pdf"}]}}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"XXX","output":{"state":"error","'
+        'kind":"rag_error","error":"External document URL are not accepted yet."}}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionToken'
+        's":0,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # Check that the conversation was not updated
@@ -517,26 +489,22 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
                 id=str(uuid.uuid4()),
                 createdAt=timezone.now(),
                 content="What is in this document?",
-                reasoning=None,
-                experimental_attachments=[
-                    Attachment(name="sample.pdf", contentType="application/pdf", url=document_url)
-                ],
                 role="user",
-                annotations=None,
-                toolInvocations=None,
                 parts=[
                     TextUIPart(type="text", text="What is in this document?"),
+                    FileUIPart(
+                        type="file",
+                        filename="sample.pdf",
+                        mediaType="application/pdf",
+                        url=document_url,
+                    ),
                 ],
             ),
             UIMessage(
                 id=str(uuid.uuid4()),
                 createdAt=timezone.now(),
                 content="This is a document about a single pixel.",
-                reasoning=None,
-                experimental_attachments=None,
                 role="assistant",
-                annotations=None,
-                toolInvocations=None,
                 parts=[
                     TextUIPart(type="text", text="This is a document about a single pixel."),
                 ],
@@ -668,7 +636,7 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -678,10 +646,14 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '0:"This is a document of square, very small and nice."\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":50,"completionTokens":11,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"This is a document of square, very smal'
+        'l and nice."}\n\n'
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":50,"completionToke'
+        'ns":11,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # Check that the conversation was updated
@@ -693,15 +665,12 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
         id=chat_conversation.messages[0].id,
         createdAt=timezone.now(),
         content="What is in this document?",
-        reasoning=None,
-        experimental_attachments=[
-            Attachment(name="sample.pdf", contentType="application/pdf", url=document_url)
-        ],
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(type="text", text="What is in this document?"),
+            FileUIPart(
+                type="file", filename="sample.pdf", mediaType="application/pdf", url=document_url
+            ),
         ],
     )
 
@@ -710,11 +679,7 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
         id=chat_conversation.messages[1].id,
         createdAt=timezone.now(),
         content="This is a document about a single pixel.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(type="text", text="This is a document about a single pixel."),
         ],
@@ -725,11 +690,7 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
         id=chat_conversation.messages[2].id,
         createdAt=timezone.now(),
         content="Give more details about this document.",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(type="text", text="Give more details about this document."),
         ],
@@ -740,11 +701,7 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
         id=chat_conversation.messages[3].id,
         createdAt=timezone.now(),
         content="This is a document of square, very small and nice.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(type="text", text="This is a document of square, very small and nice."),
         ],
@@ -814,6 +771,7 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
                 }
             ],
             "run_id": _run_id,
+            "state": "complete",
             "timestamp": "2025-10-18T20:48:20.286204Z",
         },
         {
@@ -852,7 +810,7 @@ def test_post_conversation_with_local_document_url_in_history(  # pylint: disabl
     ]
 
 
-@responses.activate
+@respx.mock
 @freeze_time()
 @pytest.mark.parametrize(
     "file_name,content_type",
@@ -873,25 +831,16 @@ def test_post_conversation_with_local_not_pdf_document_url(
     """
     Test POST to /api/v1/chats/{pk}/conversation/ with a document URL.
     """
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/collections",
-        json={"id": 123, "object": "collection"},
-        status=200,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/collections").mock(
+        return_value=httpx.Response(200, json={"id": 123, "object": "collection"})
     )
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/parse-beta",
-        json={"id": "parse_id", "object": "document content"},
-        status=200,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/ocr").mock(
+        return_value=httpx.Response(200, json={"pages": [{"markdown": "document content"}]})
     )
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/documents",
-        json={"id": "document_id", "object": "document"},
-        status=200,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/documents").mock(
+        return_value=httpx.Response(200, json={"id": "document_id", "object": "document"})
     )
-    responses.post(
-        "https://app-find/api/v1.0/documents/index/",
-        status=200,
-    )
+    respx.post("https://app-find/api/v1.0/documents/index/").mock(return_value=httpx.Response(200))
 
     chat_conversation = ChatConversationFactory(owner__language="en-us", collection_id="123")
     api_client.force_authenticate(user=chat_conversation.owner)
@@ -917,13 +866,7 @@ def test_post_conversation_with_local_not_pdf_document_url(
                 text="What is in this document?",
                 type="text",
             ),
-        ],
-        experimental_attachments=[
-            Attachment(
-                name=file_name,
-                contentType=content_type,
-                url=document_url,
-            )
+            FileUIPart(type="file", filename=file_name, mediaType=content_type, url=document_url),
         ],
     )
 
@@ -959,7 +902,7 @@ def test_post_conversation_with_local_not_pdf_document_url(
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -969,13 +912,16 @@ def test_post_conversation_with_local_not_pdf_document_url(
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '9:{"toolCallId":"XXX","toolName":"document_parsing",'
-        f'"args":{{"documents":[{{"identifier":"{file_name}"}}]}}}}\n'
-        'a:{"toolCallId":"XXX","result":{"state":"done"}}\n'
-        '0:"This is a document about you."\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":50,"completionTokens":7,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"XXX","toolName":"document_parsing"'
+        f',"input":{{"documents":[{{"identifier":"{file_name}"}}]}}}}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"XXX","output":{"state":"done"}}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"This is a document about you."}\n\n'
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":50,"completionTokens":7'
+        ',"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # Check that the conversation was updated
@@ -987,11 +933,8 @@ def test_post_conversation_with_local_not_pdf_document_url(
         id=chat_conversation.messages[0].id,
         createdAt=timezone.now(),
         content="What is in this document?",
-        reasoning=None,
         experimental_attachments=None,  # We should fix this, but for now document appears in source
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(type="text", text="What is in this document?"),
         ],
@@ -1002,11 +945,7 @@ def test_post_conversation_with_local_not_pdf_document_url(
         id=chat_conversation.messages[1].id,
         createdAt=timezone.now(),
         content="This is a document about you.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(type="text", text="This is a document about you."),
         ],
@@ -1034,6 +973,7 @@ def test_post_conversation_with_local_not_pdf_document_url(
                 },
             ],
             "run_id": _run_id,
+            "state": "complete",
             "timestamp": timestamp,
         },
         {

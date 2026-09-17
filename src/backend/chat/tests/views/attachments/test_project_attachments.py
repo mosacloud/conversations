@@ -7,13 +7,15 @@ from unittest import mock
 from django.core.files.storage import default_storage
 from django.test import override_settings
 
+import httpx
 import pytest
-import responses
+import respx
 from rest_framework import status as http_status
 
 from core.file_upload.enums import AttachmentStatus, FileUploadMode
 
 from chat import factories, models
+from chat.enums import AttachmentIndexState
 from chat.tests.conftest import PIXEL_PNG
 
 pytestmark = pytest.mark.django_db
@@ -22,12 +24,6 @@ pytestmark = pytest.mark.django_db
 @pytest.fixture(name="albert_settings")
 def fixture_albert_settings(settings):
     """Configure Albert backend so per-document delete hits a known URL."""
-    settings.RAG_DOCUMENT_SEARCH_BACKEND = (
-        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend"
-    )
-    settings.RAG_DOCUMENT_PARSER = "chat.agent_rag.document_converter.parser.AlbertParser"
-    settings.ALBERT_API_URL = "https://albert.api.etalab.gouv.fr"
-    settings.ALBERT_API_KEY = "albert-api-key"
     return settings
 
 
@@ -166,7 +162,7 @@ def test_project_attachment_create_companion_rows_excluded_from_caps(api_client,
     assert "maximum of 1 files" in response.json()["content_type"][0]
 
 
-@mock.patch("chat.views.malware_detection.analyse_file")
+@mock.patch("chat.views.attachments.malware_detection.analyse_file")
 def test_project_backend_upload_files_cap(_mock_malware, api_client, settings):
     """The cap is enforced before the S3 upload on the backend-upload path."""
     settings.PROJECT_FILES_MAX_COUNT = 1
@@ -247,8 +243,8 @@ def test_project_attachment_retrieve_success(api_client, upload_state, expected_
 
 
 @override_settings(POSTHOG_KEY="test_key")
-@mock.patch("chat.views.posthog")
-@mock.patch("chat.views.malware_detection.analyse_file")
+@mock.patch("core.analytics.posthog")
+@mock.patch("chat.views.attachments.malware_detection.analyse_file")
 def test_project_upload_ended_success(mock_analyse_file, mock_posthog, api_client):
     """The 'upload_ended' action should change the attachment state and trigger analysis."""
     attachment = factories.ChatProjectAttachmentFactory(
@@ -282,6 +278,9 @@ def test_project_upload_ended_success(mock_analyse_file, mock_posthog, api_clien
         project_id=attachment.project.pk,
     )
     mock_posthog.capture.assert_called_once()
+    # Conversation and project uploads share this action: without the holder
+    # they are indistinguishable in PostHog.
+    assert mock_posthog.capture.call_args.kwargs["properties"]["holder"] == "project"
 
 
 def test_project_upload_ended_not_pending(api_client):
@@ -398,7 +397,7 @@ def test_project_attachment_delete_success(api_client):
     assert not models.ChatConversationAttachment.objects.filter(pk=attachment.pk).exists()
 
 
-@responses.activate
+@respx.mock
 def test_project_attachment_delete_drops_rag_document(api_client, albert_settings):
     """Deleting an indexed attachment removes its document from the RAG collection."""
     project = factories.ChatProjectFactory(collection_id="42")
@@ -407,9 +406,8 @@ def test_project_attachment_delete_drops_rag_document(api_client, albert_setting
         rag_document_id="123",
     )
     api_client.force_login(project.owner)
-    delete_doc_mock = responses.delete(
-        f"{albert_settings.ALBERT_API_URL}/v1/documents/123",
-        status=http_status.HTTP_204_NO_CONTENT,
+    delete_doc_mock = respx.delete(f"{albert_settings.ALBERT_API_URL}/v1/documents/123").mock(
+        return_value=httpx.Response(http_status.HTTP_204_NO_CONTENT)
     )
 
     url = f"/api/v1.0/projects/{project.pk}/attachments/{attachment.pk!s}/"
@@ -420,7 +418,7 @@ def test_project_attachment_delete_drops_rag_document(api_client, albert_setting
     assert not models.ChatConversationAttachment.objects.filter(pk=attachment.pk).exists()
 
 
-@responses.activate
+@respx.mock
 def test_project_attachment_delete_skips_backend_when_no_doc_id(api_client, albert_settings):
     """An attachment without rag_document_id (image, Find backend) skips the backend call."""
     project = factories.ChatProjectFactory(collection_id="42")
@@ -429,9 +427,8 @@ def test_project_attachment_delete_skips_backend_when_no_doc_id(api_client, albe
         rag_document_id=None,
     )
     api_client.force_login(project.owner)
-    delete_doc_mock = responses.delete(
-        f"{albert_settings.ALBERT_API_URL}/v1/documents/anything",
-        status=http_status.HTTP_204_NO_CONTENT,
+    delete_doc_mock = respx.delete(f"{albert_settings.ALBERT_API_URL}/v1/documents/anything").mock(
+        return_value=httpx.Response(http_status.HTTP_204_NO_CONTENT)
     )
 
     url = f"/api/v1.0/projects/{project.pk}/attachments/{attachment.pk!s}/"
@@ -442,7 +439,7 @@ def test_project_attachment_delete_skips_backend_when_no_doc_id(api_client, albe
     assert not models.ChatConversationAttachment.objects.filter(pk=attachment.pk).exists()
 
 
-@responses.activate
+@respx.mock
 def test_project_attachment_delete_succeeds_when_backend_fails(api_client, albert_settings, caplog):
     """A backend failure is logged but does not block the attachment delete."""
     project = factories.ChatProjectFactory(collection_id="42")
@@ -451,9 +448,8 @@ def test_project_attachment_delete_succeeds_when_backend_fails(api_client, alber
         rag_document_id="123",
     )
     api_client.force_login(project.owner)
-    responses.delete(
-        f"{albert_settings.ALBERT_API_URL}/v1/documents/123",
-        status=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+    respx.delete(f"{albert_settings.ALBERT_API_URL}/v1/documents/123").mock(
+        return_value=httpx.Response(http_status.HTTP_500_INTERNAL_SERVER_ERROR)
     )
     caplog.set_level(logging.ERROR, logger="chat.views")
 
@@ -465,7 +461,7 @@ def test_project_attachment_delete_succeeds_when_backend_fails(api_client, alber
     assert any("Failed to delete RAG document 123" in record.message for record in caplog.records)
 
 
-@responses.activate
+@respx.mock
 def test_project_attachment_delete_removes_markdown_companion(api_client, albert_settings):
     """Deleting the original drops its hidden markdown companion row too.
 
@@ -495,9 +491,8 @@ def test_project_attachment_delete_removes_markdown_companion(api_client, albert
         content_type="text/markdown",
         conversion_from=None,
     )
-    responses.delete(
-        f"{albert_settings.ALBERT_API_URL}/v1/documents/123",
-        status=http_status.HTTP_204_NO_CONTENT,
+    respx.delete(f"{albert_settings.ALBERT_API_URL}/v1/documents/123").mock(
+        return_value=httpx.Response(http_status.HTTP_204_NO_CONTENT)
     )
     api_client.force_login(project.owner)
 
@@ -511,7 +506,7 @@ def test_project_attachment_delete_removes_markdown_companion(api_client, albert
     assert models.ChatConversationAttachment.objects.filter(pk=unrelated.pk).exists()
 
 
-@responses.activate
+@respx.mock
 def test_project_attachment_delete_runs_rag_before_s3(api_client, albert_settings):
     """`perform_destroy` must remove the RAG document before deleting the S3 blob.
 
@@ -525,9 +520,8 @@ def test_project_attachment_delete_runs_rag_before_s3(api_client, albert_setting
         rag_document_id="123",
     )
     api_client.force_login(project.owner)
-    responses.delete(
-        f"{albert_settings.ALBERT_API_URL}/v1/documents/123",
-        status=http_status.HTTP_204_NO_CONTENT,
+    respx.delete(f"{albert_settings.ALBERT_API_URL}/v1/documents/123").mock(
+        return_value=httpx.Response(http_status.HTTP_204_NO_CONTENT)
     )
 
     call_order = []
@@ -582,7 +576,7 @@ def test_project_backend_upload_not_owner_forbidden(api_client):
     assert response.status_code == 404
 
 
-@mock.patch("chat.views.malware_detection.analyse_file")
+@mock.patch("chat.views.attachments.malware_detection.analyse_file")
 def test_project_backend_upload_success(mock_malware, api_client):
     """Test successful backend file upload for a project."""
     project = factories.ChatProjectFactory()
@@ -611,7 +605,7 @@ def test_project_backend_upload_success(mock_malware, api_client):
     mock_malware.assert_called_once()
 
 
-@mock.patch("chat.views.malware_detection.analyse_file")
+@mock.patch("chat.views.attachments.malware_detection.analyse_file")
 def test_project_backend_upload_creates_s3_file(_mock_malware, api_client):
     """Test that backend upload creates file in S3."""
     project = factories.ChatProjectFactory()
@@ -632,3 +626,61 @@ def test_project_backend_upload_creates_s3_file(_mock_malware, api_client):
     with default_storage.open(key, "rb") as f:
         content = f.read()
     assert content == PIXEL_PNG
+
+
+# ------------------------------------------------------------------ #
+# Reindex (user-initiated retry of a failed indexing)
+# ------------------------------------------------------------------ #
+
+
+def test_project_attachment_reindex_not_owner_forbidden(api_client):
+    """A user who does not own the project cannot reindex its attachments."""
+    attachment = factories.ChatProjectAttachmentFactory(
+        index_state=AttachmentIndexState.FAILED,
+    )
+    api_client.force_login(factories.UserFactory())
+
+    url = f"/api/v1.0/projects/{attachment.project.pk}/attachments/{attachment.pk!s}/reindex/"
+    response = api_client.post(url)
+
+    assert response.status_code == 404
+
+
+@mock.patch("chat.views.attachments.index_project_attachment_task")
+def test_project_attachment_reindex_success(mock_task, api_client):
+    """Reindexing a FAILED attachment resets it to INDEXING and re-enqueues the task."""
+    attachment = factories.ChatProjectAttachmentFactory(
+        content_type="application/pdf",
+        upload_state=AttachmentStatus.READY,
+        index_state=AttachmentIndexState.FAILED,
+        processing_error="boom",
+    )
+    api_client.force_login(attachment.project.owner)
+
+    url = f"/api/v1.0/projects/{attachment.project.pk}/attachments/{attachment.pk!s}/reindex/"
+    response = api_client.post(url)
+
+    assert response.status_code == 200
+    attachment.refresh_from_db()
+    assert attachment.index_state == AttachmentIndexState.INDEXING
+    assert attachment.processing_error is None
+    mock_task.delay.assert_called_once_with(attachment.pk)
+
+
+@mock.patch("chat.views.attachments.index_project_attachment_task")
+def test_project_attachment_reindex_rejected_when_not_failed(mock_task, api_client):
+    """Reindex is only allowed for FAILED rows; an INDEXED row is rejected."""
+    attachment = factories.ChatProjectAttachmentFactory(
+        content_type="application/pdf",
+        upload_state=AttachmentStatus.READY,
+        index_state=AttachmentIndexState.INDEXED,
+    )
+    api_client.force_login(attachment.project.owner)
+
+    url = f"/api/v1.0/projects/{attachment.project.pk}/attachments/{attachment.pk!s}/reindex/"
+    response = api_client.post(url)
+
+    assert response.status_code == 400
+    attachment.refresh_from_db()
+    assert attachment.index_state == AttachmentIndexState.INDEXED
+    mock_task.delay.assert_not_called()

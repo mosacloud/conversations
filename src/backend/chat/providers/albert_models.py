@@ -2,7 +2,13 @@
 
 from typing import Any
 
-from pydantic_ai.models.openai import ChatCompletionChunk, OpenAIChatModel, OpenAIStreamedResponse
+from openai.types import chat
+from pydantic_ai.models.openai import (
+    ChatCompletionChunk,
+    OpenAIChatModel,
+    OpenAIStreamedResponse,
+    _ChatCompletion,
+)
 from pydantic_ai.providers.openai import OpenAIProvider
 
 
@@ -51,6 +57,22 @@ class AlbertOpenAIStreamedResponse(OpenAIStreamedResponse):
         return result
 
 
+def _normalize_tool_call_types(choices: list) -> None:
+    """Coerce non-conforming tool_call `type` values to 'function' in place.
+
+    'custom' is only valid with a `custom` payload; any other type (including
+    'custom' with a function payload) must be 'function' to pass the openai SDK
+    union validation.
+    """
+    for choice in choices:
+        for tool_call in (choice.get("message") or {}).get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            is_custom = tool_call.get("type") == "custom" and "custom" in tool_call
+            if not is_custom and tool_call.get("type") != "function":
+                tool_call["type"] = "function"
+
+
 class AlbertOpenAIChatModel(OpenAIChatModel):
     """
     OpenAIChatModel subclass that preserves Albert's carbon impact data.
@@ -68,3 +90,30 @@ class AlbertOpenAIChatModel(OpenAIChatModel):
     @property
     def _streamed_response_cls(self) -> type[OpenAIStreamedResponse]:
         return AlbertOpenAIStreamedResponse
+
+    def _validate_completion(self, response: chat.ChatCompletion) -> _ChatCompletion:
+        """Normalize Albert API quirks before validation.
+
+        Albert's OpenAI-compatible API has two known non-conformances:
+        1. tool_calls[].type may not be 'function' — normalized to 'function',
+           unless the tool call is a genuine custom tool call (type='custom'
+           with a `custom` payload, which the openai SDK requires).
+        2. On multi-turn tool-call conversations, the second response sometimes
+           returns a non-standard `object` value. This is normalized before
+           passing to _ChatCompletion.model_validate().
+        """
+        data = response.model_dump()
+
+        if data.get("object") != "chat.completion":
+            data["object"] = "chat.completion"
+
+        # Only normalize tool-call types when `choices` is a genuine list. A
+        # malformed non-list value is left untouched so model_validate() raises a
+        # clear ValidationError here, rather than being coerced to `[]` (which
+        # passes validation and then makes pydantic-ai raise IndexError on
+        # response.choices[0]).
+        choices = data.get("choices")
+        if isinstance(choices, list):
+            _normalize_tool_call_types(choices)
+
+        return _ChatCompletion.model_validate(data)

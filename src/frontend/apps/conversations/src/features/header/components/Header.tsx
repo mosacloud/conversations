@@ -1,27 +1,32 @@
 import { Button } from '@gouvfr-lasuite/cunningham-react';
-import dynamic from 'next/dynamic';
-import { useRouter } from 'next/router';
-import { useEffect as _useEffect, useState as _useState } from 'react';
+import {
+  Suspense,
+  useEffect as _useEffect,
+  useState as _useState,
+  lazy,
+} from 'react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router';
 import { css } from 'styled-components';
 
-import NewChatIcon from '@/assets/icons/new-message-bold.svg';
-import LogoAssistant from '@/assets/logo/logomark.svg';
+import NewChatIcon from '@/assets/icons/new-message-bold.svg?react';
+import LogoAssistant from '@/assets/logo/logomark.svg?react';
 import { Box } from '@/components/';
 import { useCunninghamTheme } from '@/cunningham';
 import { useChatScroll } from '@/features/chat/hooks';
 import { useChatPreferencesStore } from '@/features/chat/stores/useChatPreferencesStore';
 import { useResponsiveStore } from '@/stores';
+import { useConversationRouteId } from '@/utils';
 
 import { HEADER_HEIGHT } from '../conf';
 
+import { AppSwitcher } from './AppSwitcher';
 import { ButtonToggleLeftPanel } from './ButtonToggleLeftPanel';
-import { LaGaufre } from './LaGaufre';
 
-const UserInfo = dynamic(
-  () =>
-    import('@/features/auth/components/UserInfo').then((mod) => mod.UserInfo),
-  { ssr: false },
+const UserInfo = lazy(() =>
+  import('@/features/auth/components/UserInfo').then((mod) => ({
+    default: mod.UserInfo,
+  })),
 );
 
 const headerStyles = css`
@@ -39,14 +44,13 @@ const headerStyles = css`
 export const Header = () => {
   const { t } = useTranslation();
   const { spacingsTokens, componentTokens } = useCunninghamTheme();
-  const showLaGaufre =
+  const showAppSwitcher =
     (componentTokens as Record<string, unknown>)['la-gaufre'] === true;
   const { isDesktop } = useResponsiveStore();
   const { setPanelOpen } = useChatPreferencesStore();
   const { isAtTop } = useChatScroll();
-  const router = useRouter();
-  const hasConversationIdInRoute =
-    router.query.id && router.query.id.length > 0;
+  const navigate = useNavigate();
+  const hasConversationIdInRoute = !!useConversationRouteId();
 
   return (
     <Box
@@ -93,7 +97,7 @@ export const Header = () => {
             <Button
               size="small"
               onClick={() => {
-                void router.push('/');
+                void navigate('/');
                 setPanelOpen(false);
               }}
               className="mobile-no-focus"
@@ -107,8 +111,10 @@ export const Header = () => {
       ) : (
         <Box $align="center" $direction="column">
           <Box $direction="row" $gap="4px" className="selector-header">
-            {showLaGaufre && <LaGaufre />}
-            <UserInfo />
+            {showAppSwitcher && <AppSwitcher />}
+            <Suspense fallback={null}>
+              <UserInfo />
+            </Suspense>
           </Box>
         </Box>
       )}

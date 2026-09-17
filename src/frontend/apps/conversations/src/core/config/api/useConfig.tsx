@@ -6,25 +6,11 @@ import { BaseTheme } from '@/cunningham/';
 import { FooterType } from '@/features/footer';
 import { PostHogConf } from '@/services';
 
-interface WaffleService {
-  name: string;
-  url: string;
-  logo?: string;
-  maturity?: string;
-}
-
-interface WaffleCustomization {
-  apiUrl?: string;
-  data?: { services: WaffleService[] };
-  label?: string;
-  showMoreLimit?: number;
-  widgetPath?: string;
-}
-
 interface ThemeCustomization {
   footer?: FooterType;
   translations?: Resource;
-  waffle?: WaffleCustomization;
+  /** App switcher entries: app id (ai, docs, drive, meet, mail, …) → root URL. */
+  app_switcher?: Record<string, string>;
 }
 
 export enum FeatureFlagState {
@@ -50,7 +36,6 @@ export interface MaintenanceConfig {
 }
 
 export interface ConfigResponse {
-  ACTIVATION_REQUIRED: boolean;
   STATUS_PAGE_URL?: string | null;
   ENVIRONMENT: string;
   FEATURE_FLAGS: FeatureFlags;
@@ -70,6 +55,7 @@ export interface ConfigResponse {
   status_banner?: StatusBanner;
   maintenance?: MaintenanceConfig | null;
   chat_upload_accept?: string;
+  DOCS_BASE_URL?: string;
   project_files_max_count?: number;
   project_images_max_count?: number;
   attachment_max_size?: number;

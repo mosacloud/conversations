@@ -5,9 +5,15 @@ from typing import List, Optional
 
 from django.conf import settings
 
-import requests
+import httpx
 
 logger = logging.getLogger(__name__)
+
+# Brevo answers the "add to list" endpoint with a 400 when it has nothing to add.
+# The message is ambiguous on purpose ("already in list" OR "does not exist"), but we
+# always create the contact right before adding it, so only the first branch can apply:
+# this is an expected no-op, not a failure.
+BREVO_NOTHING_TO_ADD_MESSAGE = "Contact already in list and/or does not exist"
 
 
 def create_contact_in_brevo(email: str) -> bool:
@@ -34,12 +40,12 @@ def create_contact_in_brevo(email: str) -> bool:
         "updateEnabled": True,
     }
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
-    except requests.RequestException as e:
+        response = httpx.post(url, json=payload, headers=headers, timeout=5)
+    except httpx.HTTPError as e:
         logger.exception(e)
         return False
 
-    if not response.ok:
+    if not response.is_success:
         logger.error(
             "Error creating contact in Brevo %s: (%s) %s",
             email,
@@ -82,12 +88,16 @@ def add_user_to_brevo_list(emails: List[str], list_id: Optional[str]) -> None:
         "emails": emails,
     }
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
-    except requests.RequestException as e:
+        response = httpx.post(url, json=payload, headers=headers, timeout=5)
+    except httpx.HTTPError as e:
         logger.exception(e)
         return
 
     if response.status_code != 201:
+        if response.status_code == 400 and BREVO_NOTHING_TO_ADD_MESSAGE in response.text:
+            logger.info("Contacts %s already in Brevo list (%s)", emails, list_id)
+            return
+
         logger.error(
             "Error adding contacts to Brevo (%s) %s: (%s) %s",
             list_id,
@@ -121,8 +131,8 @@ def remove_user_from_brevo_list(emails: List[str], list_id: Optional[str]) -> No
         "emails": emails,
     }
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
-    except requests.RequestException as e:
+        response = httpx.post(url, json=payload, headers=headers, timeout=5)
+    except httpx.HTTPError as e:
         logger.exception(e)
         return
     if response.status_code != 201:

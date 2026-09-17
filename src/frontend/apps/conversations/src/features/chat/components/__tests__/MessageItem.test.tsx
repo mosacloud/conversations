@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { Suspense } from 'react';
 
 import { ToastProvider } from '@/components/ToastProvider';
+import { stampImagesSkippedOnLatestUserMessage } from '@/features/chat/api/useChat';
 
 import {
   MessageItem,
@@ -12,41 +13,65 @@ import {
   splitStreamingContent,
 } from '../MessageItem';
 
+const TEST_CO2_IMPACT_KG = 0.00002191613089507352;
+
 // Mock react-markdown (ESM module)
-jest.mock('react-markdown', () => ({
+vi.mock('react-markdown', () => ({
   MarkdownHooks: ({ children }: { children: string }) => (
     <div data-testid="markdown-content">{children}</div>
   ),
 }));
 
-jest.mock('@shikijs/rehype/core', () => () => {});
-jest.mock('../../utils/shiki', () => ({
+vi.mock('@shikijs/rehype/core', () => ({ default: () => {} }));
+vi.mock('../../utils/shiki', () => ({
   getHighlighter: () => Promise.resolve({}),
 }));
-jest.mock('rehype-katex', () => () => {});
-jest.mock('remark-gfm', () => () => {});
-jest.mock('remark-math', () => () => {});
+vi.mock('rehype-katex', () => ({ default: () => {} }));
+vi.mock('remark-gfm', () => ({ default: () => {} }));
+vi.mock('remark-math', () => ({ default: () => {} }));
 
-jest.mock('react-i18next', () => ({
+vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string) => key,
   }),
 }));
 
-// Mock child components
-jest.mock('../AttachmentList', () => ({
-  AttachmentList: () => <div data-testid="attachment-list" />,
+const mockConfig: { DOCS_BASE_URL?: string } = { DOCS_BASE_URL: undefined };
+vi.mock('@/core/config', () => ({
+  useConfig: () => ({ data: mockConfig }),
 }));
 
-jest.mock('../FeedbackButtons', () => ({
+vi.mock('../MoreActionsButton', () => ({
+  MoreActionsButton: () => <div data-testid="more-actions-button" />,
+}));
+
+// Mock child components
+vi.mock('../AttachmentList', () => ({
+  AttachmentList: ({
+    attachments,
+  }: {
+    attachments: { skipped?: unknown }[];
+  }) => (
+    <div
+      data-testid="attachment-list"
+      data-skipped={attachments.filter((one) => one.skipped).length}
+    />
+  ),
+}));
+
+vi.mock('../FeedbackButtons', () => ({
   FeedbackButtons: () => <div data-testid="feedback-buttons" />,
 }));
 
-jest.mock('../SourceItemList', () => ({
+vi.mock('../MessageEnergyIndicator', () => ({
+  MessageEnergyIndicator: () => <div data-testid="message-energy-indicator" />,
+}));
+
+vi.mock('../SourceItemList', () => ({
   SourceItemList: () => <div data-testid="source-item-list" />,
 }));
 
-jest.mock('../ToolInvocationItem', () => ({
+vi.mock('../ToolInvocationItem', () => ({
   ToolInvocationItem: () => <div data-testid="tool-invocation-item" />,
 }));
 
@@ -351,7 +376,7 @@ describe('MessageItem', () => {
     message: {
       id: 'msg-1',
       role: 'assistant' as const,
-      content: 'Hello world',
+      parts: [{ type: 'text' as const, text: 'Hello world' }],
     },
     isLastMessage: false,
     isLastAssistantMessage: false,
@@ -361,23 +386,48 @@ describe('MessageItem', () => {
     conversationId: 'conv-1',
     isSourceOpen: null,
     isMobile: false,
-    onCopyToClipboard: jest.fn(),
-    onOpenSources: jest.fn(),
-    getMetadata: jest.fn(),
+    onCopyToClipboard: vi.fn(),
+    onOpenSources: vi.fn(),
   };
 
+  const withProviders = (ui: React.ReactNode) => (
+    <CunninghamProvider>
+      <ToastProvider>
+        <Suspense fallback={null}>{ui}</Suspense>
+      </ToastProvider>
+    </CunninghamProvider>
+  );
+
   const renderWithProviders = (ui: React.ReactNode) => {
-    return render(
-      <CunninghamProvider>
-        <ToastProvider>
-          <Suspense fallback={null}>{ui}</Suspense>
-        </ToastProvider>
-      </CunninghamProvider>,
-    );
+    return render(withProviders(ui));
   };
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
+    mockConfig.DOCS_BASE_URL = undefined;
+  });
+
+  describe('Edit in Docs button', () => {
+    it('shows for a content-only message with no text parts when Docs is configured', async () => {
+      mockConfig.DOCS_BASE_URL = 'https://docs.example.com/';
+
+      await act(async () => {
+        // defaultProps.message has `content` but no `parts` (hydrated case).
+        renderWithProviders(<MessageItem {...defaultProps} />);
+      });
+
+      expect(screen.getByTestId('more-actions-button')).toBeInTheDocument();
+    });
+
+    it('is hidden when Docs is not configured', async () => {
+      await act(async () => {
+        renderWithProviders(<MessageItem {...defaultProps} />);
+      });
+
+      expect(
+        screen.queryByTestId('more-actions-button'),
+      ).not.toBeInTheDocument();
+    });
   });
 
   describe('rendering', () => {
@@ -436,6 +486,60 @@ describe('MessageItem', () => {
       ).not.toBeInTheDocument();
     });
 
+    it('does not render the action bar before the answer has content', async () => {
+      // v5 creates the assistant message as soon as the response starts, with
+      // no parts yet. The bar used to render on that empty bubble, putting the
+      // rating controls on screen ahead of the answer.
+      await act(async () => {
+        renderWithProviders(
+          <MessageItem
+            {...defaultProps}
+            message={{ ...defaultProps.message, parts: [] }}
+            status="submitted"
+            isLastAssistantMessage={true}
+          />,
+        );
+      });
+
+      expect(
+        screen.queryByRole('button', { name: 'Copy' }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('does not render the action bar for a text part that is still empty', async () => {
+      await act(async () => {
+        renderWithProviders(
+          <MessageItem
+            {...defaultProps}
+            message={{
+              ...defaultProps.message,
+              parts: [{ type: 'text' as const, text: '' }],
+            }}
+            status="submitted"
+            isLastAssistantMessage={true}
+          />,
+        );
+      });
+
+      expect(
+        screen.queryByRole('button', { name: 'Copy' }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('renders the action bar once the answer has content', async () => {
+      await act(async () => {
+        renderWithProviders(
+          <MessageItem
+            {...defaultProps}
+            status="ready"
+            isLastAssistantMessage={true}
+          />,
+        );
+      });
+
+      expect(screen.getByRole('button', { name: 'Copy' })).toBeInTheDocument();
+    });
+
     it('hides copy text on mobile', async () => {
       await act(async () => {
         renderWithProviders(<MessageItem {...defaultProps} isMobile={true} />);
@@ -448,7 +552,7 @@ describe('MessageItem', () => {
   describe('interactions', () => {
     it('calls onCopyToClipboard when copy button is clicked', async () => {
       const user = userEvent.setup();
-      const onCopyToClipboard = jest.fn();
+      const onCopyToClipboard = vi.fn();
 
       await act(async () => {
         renderWithProviders(
@@ -474,7 +578,9 @@ describe('MessageItem', () => {
             {...defaultProps}
             message={{
               ...defaultProps.message,
-              content: 'Block 1\n\nPending content',
+              parts: [
+                { type: 'text' as const, text: 'Block 1\n\nPending content' },
+              ],
             }}
             status="streaming"
             isLastAssistantMessage={true}
@@ -494,8 +600,14 @@ describe('MessageItem', () => {
     it('renders AttachmentList when message has attachments', async () => {
       const messageWithAttachments = {
         ...defaultProps.message,
-        experimental_attachments: [
-          { url: 'https://example.com/file.pdf', name: 'file.pdf' },
+        parts: [
+          ...defaultProps.message.parts,
+          {
+            type: 'file' as const,
+            url: 'https://example.com/file.pdf',
+            filename: 'file.pdf',
+            mediaType: 'application/pdf',
+          },
         ],
       };
 
@@ -508,12 +620,80 @@ describe('MessageItem', () => {
       expect(screen.getByTestId('attachment-list')).toBeInTheDocument();
     });
 
+    it('re-renders when the backend marks an image as skipped', async () => {
+      // The stamp mutates the part in place, leaving the file count unchanged:
+      // the memo comparator has to look at the skip state itself.
+      const message = {
+        ...defaultProps.message,
+        role: 'user' as const,
+        parts: [
+          { type: 'text' as const, text: 'Look at this' },
+          {
+            type: 'file' as const,
+            url: 'https://example.com/photo.png',
+            filename: 'photo.png',
+            mediaType: 'image/png',
+          },
+        ],
+      };
+
+      const { rerender } = render(
+        withProviders(<MessageItem {...defaultProps} message={message} />),
+      );
+      expect(screen.getByTestId('attachment-list')).toHaveAttribute(
+        'data-skipped',
+        '0',
+      );
+
+      const [stamped] = stampImagesSkippedOnLatestUserMessage([message]);
+      await act(async () => {
+        rerender(
+          withProviders(<MessageItem {...defaultProps} message={stamped} />),
+        );
+      });
+
+      expect(screen.getByTestId('attachment-list')).toHaveAttribute(
+        'data-skipped',
+        '1',
+      );
+    });
+
     it('does not render AttachmentList when no attachments', async () => {
       await act(async () => {
         renderWithProviders(<MessageItem {...defaultProps} />);
       });
 
       expect(screen.queryByTestId('attachment-list')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('energy indicator', () => {
+    it('renders MessageEnergyIndicator when co2 metadata is present', async () => {
+      await act(async () => {
+        renderWithProviders(
+          <MessageItem
+            {...defaultProps}
+            message={{
+              ...defaultProps.message,
+              metadata: { co2_impact: TEST_CO2_IMPACT_KG },
+            }}
+          />,
+        );
+      });
+
+      expect(
+        screen.getByTestId('message-energy-indicator'),
+      ).toBeInTheDocument();
+    });
+
+    it('does not render MessageEnergyIndicator without co2 metadata', async () => {
+      await act(async () => {
+        renderWithProviders(<MessageItem {...defaultProps} />);
+      });
+
+      expect(
+        screen.queryByTestId('message-energy-indicator'),
+      ).not.toBeInTheDocument();
     });
   });
 
@@ -537,6 +717,213 @@ describe('MessageItem', () => {
       });
 
       expect(screen.queryByTestId('feedback-buttons')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('summarization progress', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const conversationSummarizeMessage = {
+      id: 'msg-sum',
+      role: 'assistant' as const,
+      parts: [
+        {
+          type: 'tool-summarize' as const,
+          toolCallId: 'call-1',
+          state: 'input-available' as const,
+          input: { state: 'running', summary_scope: 'conversation' },
+        },
+      ],
+    };
+
+    it('renders the progress bar while conversation summarization runs', async () => {
+      await act(async () => {
+        renderWithProviders(
+          <MessageItem
+            {...defaultProps}
+            message={conversationSummarizeMessage}
+            status="streaming"
+            isLastAssistantMessage={true}
+          />,
+        );
+      });
+
+      expect(screen.getByTestId('summarization-progress')).toBeInTheDocument();
+      // The generic spinner branch must not double-render for this tool
+      // (exact-string queries: 'Summarizing...' does not match the progress
+      // bar's 'Summarizing conversation...' label).
+      expect(screen.queryByText('Summarizing...')).not.toBeInTheDocument();
+      expect(screen.queryByText('Search...')).not.toBeInTheDocument();
+    });
+
+    it('keeps the generic spinner for document-scope summarize', async () => {
+      const documentSummarizeMessage = {
+        ...conversationSummarizeMessage,
+        parts: [
+          {
+            type: 'tool-summarize' as const,
+            toolCallId: 'call-2',
+            state: 'input-available' as const,
+            input: { state: 'running', summary_scope: 'document' },
+          },
+        ],
+      };
+
+      await act(async () => {
+        renderWithProviders(
+          <MessageItem
+            {...defaultProps}
+            message={documentSummarizeMessage}
+            status="streaming"
+            isLastAssistantMessage={true}
+          />,
+        );
+      });
+
+      expect(screen.getByText('Summarizing...')).toBeInTheDocument();
+      expect(
+        screen.queryByTestId('summarization-progress'),
+      ).not.toBeInTheDocument();
+    });
+
+    it('replaces the progress bar with the error and retry when summarization fails', async () => {
+      const onRetry = vi.fn();
+      await act(async () => {
+        renderWithProviders(
+          <MessageItem
+            {...defaultProps}
+            message={conversationSummarizeMessage}
+            status="error"
+            chatErrorType="summarization_failed"
+            onRetry={onRetry}
+            isLastAssistantMessage={true}
+          />,
+        );
+      });
+
+      expect(screen.getByTestId('summarization-error')).toBeInTheDocument();
+      expect(
+        screen.queryByTestId('summarization-progress'),
+      ).not.toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole('button', { name: /retry/i }));
+      expect(onRetry).toHaveBeenCalledTimes(1);
+    });
+
+    it('takes over with a spinner once the progress bar has hidden itself', async () => {
+      vi.useFakeTimers();
+      const summarizedMessage = {
+        ...conversationSummarizeMessage,
+        parts: [
+          {
+            type: 'tool-summarize' as const,
+            toolCallId: 'call-1',
+            state: 'output-available' as const,
+            input: { state: 'running', summary_scope: 'conversation' },
+            output: { state: 'done' },
+          },
+        ],
+      };
+
+      const { rerender } = renderWithProviders(
+        <MessageItem
+          {...defaultProps}
+          message={conversationSummarizeMessage}
+          status="streaming"
+          isLastAssistantMessage={true}
+        />,
+      );
+
+      // The summary result landed: the bar completes but is still on screen.
+      rerender(
+        withProviders(
+          <MessageItem
+            {...defaultProps}
+            message={summarizedMessage}
+            status="streaming"
+            isLastAssistantMessage={true}
+          />,
+        ),
+      );
+      expect(screen.getByTestId('summarization-progress')).toBeInTheDocument();
+      expect(screen.queryByText('Thinking...')).not.toBeInTheDocument();
+
+      // Once it hides, the spinner covers the wait for the first answer token.
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(
+        screen.queryByTestId('summarization-progress'),
+      ).not.toBeInTheDocument();
+      expect(screen.getByText('Thinking...')).toBeInTheDocument();
+    });
+
+    it('drops the spinner once the answer starts streaming', async () => {
+      vi.useFakeTimers();
+      const summarizedMessage = {
+        ...conversationSummarizeMessage,
+        parts: [
+          {
+            type: 'tool-summarize' as const,
+            toolCallId: 'call-1',
+            state: 'output-available' as const,
+            input: { state: 'running', summary_scope: 'conversation' },
+            output: { state: 'done' },
+          },
+        ],
+      };
+
+      const { rerender } = renderWithProviders(
+        <MessageItem
+          {...defaultProps}
+          message={summarizedMessage}
+          status="streaming"
+          isLastAssistantMessage={true}
+        />,
+      );
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(screen.getByText('Thinking...')).toBeInTheDocument();
+
+      rerender(
+        withProviders(
+          <MessageItem
+            {...defaultProps}
+            message={{
+              ...summarizedMessage,
+              parts: [
+                ...summarizedMessage.parts,
+                { type: 'text' as const, text: 'Here is the answer' },
+              ],
+            }}
+            status="streaming"
+            isLastAssistantMessage={true}
+          />,
+        ),
+      );
+      expect(screen.queryByText('Thinking...')).not.toBeInTheDocument();
+    });
+
+    it('does not render the summarization error for other error types', async () => {
+      await act(async () => {
+        renderWithProviders(
+          <MessageItem
+            {...defaultProps}
+            message={conversationSummarizeMessage}
+            status="error"
+            chatErrorType="generic"
+            onRetry={vi.fn()}
+            isLastAssistantMessage={true}
+          />,
+        );
+      });
+
+      expect(
+        screen.queryByTestId('summarization-error'),
+      ).not.toBeInTheDocument();
     });
   });
 });

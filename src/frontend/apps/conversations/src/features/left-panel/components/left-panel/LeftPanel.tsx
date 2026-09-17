@@ -1,11 +1,10 @@
-import dynamic from 'next/dynamic';
-import { useEffect } from 'react';
+import { Suspense, lazy, useEffect } from 'react';
 import { createGlobalStyle, css } from 'styled-components';
 
 import { Box, SeparatedSection } from '@/components';
 import { useCunninghamTheme } from '@/cunningham';
 import { useChatPreferencesStore } from '@/features/chat/stores/useChatPreferencesStore';
-import { LaGaufre } from '@/features/header/components/LaGaufre';
+import { AppSwitcher } from '@/features/header/components/AppSwitcher';
 import { OnboardingButton } from '@/features/onboarding';
 import { SettingsButton } from '@/features/settings';
 import { useResponsiveStore } from '@/stores';
@@ -19,17 +18,17 @@ const MobileLeftPanelStyle = createGlobalStyle`
   }
 `;
 
-const UserInfo = dynamic(
-  () =>
-    import('@/features/auth/components/UserInfo').then((mod) => mod.UserInfo),
-  { ssr: false },
+const UserInfo = lazy(() =>
+  import('@/features/auth/components/UserInfo').then((mod) => ({
+    default: mod.UserInfo,
+  })),
 );
 
 export const LeftPanel = () => {
   const { isDesktop } = useResponsiveStore();
 
   const { spacingsTokens, componentTokens } = useCunninghamTheme();
-  const showLaGaufre =
+  const showAppSwitcher =
     (componentTokens as Record<string, unknown>)['la-gaufre'] === true;
   const { setPanelOpen, isPanelOpen } = useChatPreferencesStore();
 
@@ -133,8 +132,10 @@ export const LeftPanel = () => {
                   $gap={spacingsTokens['sm']}
                   $align="center"
                 >
-                  {showLaGaufre && <LaGaufre />}
-                  <UserInfo />
+                  {showAppSwitcher && <AppSwitcher />}
+                  <Suspense fallback={null}>
+                    <UserInfo />
+                  </Suspense>
                 </Box>
               </Box>
             </Box>

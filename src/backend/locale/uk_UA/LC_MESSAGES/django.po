@@ -2,8 +2,8 @@ msgid ""
 msgstr ""
 "Project-Id-Version: la-suite-conversations\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-06-23 14:51+0000\n"
-"PO-Revision-Date: 2026-06-24 18:13\n"
+"POT-Creation-Date: 2026-09-01 13:34+0000\n"
+"PO-Revision-Date: 2026-09-08 13:50\n"
 "Last-Translator: \n"
 "Language-Team: Ukrainian\n"
 "Language: uk_UA\n"
@@ -17,198 +17,159 @@ msgstr ""
 "X-Crowdin-File: backend-conversations.pot\n"
 "X-Crowdin-File-ID: 26\n"
 
-#: activation_codes/admin.py:55
+#: activation_codes/admin.py:79
 msgid "Configuration"
 msgstr "Налаштування"
 
-#: activation_codes/admin.py:66
+#: activation_codes/admin.py:90
 msgid "Usage details"
 msgstr "Відомості про використання"
 
-#: activation_codes/admin.py:70 activation_codes/admin.py:226
+#: activation_codes/admin.py:94 activation_codes/admin.py:212
 msgid "Timestamps"
 msgstr "Відмітки часу"
 
-#: activation_codes/admin.py:109
+#: activation_codes/admin.py:118
 msgid "Usage"
 msgstr "Використання"
 
-#: activation_codes/admin.py:117
+#: activation_codes/admin.py:126
 msgid "Description"
 msgstr "Опис"
 
-#: activation_codes/admin.py:124
+#: activation_codes/admin.py:133
 msgid "No users have used this code yet"
 msgstr "Користувачі ще не використовували цей код"
 
-#: activation_codes/admin.py:135
+#: activation_codes/admin.py:144
 msgid "Name"
 msgstr "Ім’я"
 
-#: activation_codes/admin.py:136 activation_codes/admin.py:246
+#: activation_codes/admin.py:145 activation_codes/admin.py:232
 msgid "Email"
 msgstr "Ел. пошта"
 
-#: activation_codes/admin.py:137
+#: activation_codes/admin.py:146
 msgid "Date"
 msgstr "Дата"
 
-#: activation_codes/admin.py:161
+#: activation_codes/admin.py:170
 msgid "Users who used this code"
 msgstr "Користувачі, що використовували цей код"
 
-#: activation_codes/admin.py:163
-msgid "Recompute current uses from related activations"
-msgstr "Перерахувати поточні використання пов'язаних ресурсів"
-
-#: activation_codes/admin.py:177
-msgid "All selected activation codes already have correct usage counts."
-msgstr "Усі обрані коди активації вже мають коректні лічильники використання."
-
-#: activation_codes/admin.py:182
-#, python-format
-msgid "Successfully recomputed usage counts for %(count)d activation code(s)."
-msgstr "Успішно переобчислено використання коду активації %(count)d."
-
-#: activation_codes/admin.py:240 activation_codes/admin.py:284
+#: activation_codes/admin.py:226 activation_codes/admin.py:264
 msgid "User"
 msgstr "Користувач"
 
-#: activation_codes/admin.py:291
+#: activation_codes/admin.py:271
 msgid "Has used activation code"
 msgstr "Використано код активації"
 
-#: activation_codes/admin.py:293
-msgid "Add selected users to Brevo waiting list"
-msgstr "Додати обраних користувачів до списку очікування Brevo"
-
-#: activation_codes/admin.py:314
-#, python-format
-msgid "Added %(count)d user(s) to Brevo waiting list."
-msgstr "До списку очікування Brevo додано користувачів: %(count)d."
-
-#: activation_codes/admin.py:319 activation_codes/admin.py:347
-msgid "No valid email address found in selected registrations."
-msgstr "Серед обраних реєстрацій не знайдено дійсної адреси електронної пошти."
-
-#: activation_codes/admin.py:323
-msgid "Remove selected users from Brevo waiting list"
-msgstr "Видалити обраних користувачів зі списку очікування Brevo"
-
-#: activation_codes/admin.py:342
-#, python-format
-msgid "Removed %(count)d user(s) from Brevo waiting list."
-msgstr "Зі списку очікування Brevo видалено користувачів: %(count)d"
-
-#: activation_codes/models.py:38 activation_codes/models.py:85
-#: activation_codes/models.py:178
+#: activation_codes/models.py:37 activation_codes/models.py:84
+#: activation_codes/models.py:108
 msgid "activation code"
 msgstr "код активації"
 
-#: activation_codes/models.py:39
+#: activation_codes/models.py:38
 msgid "The activation code that users will enter"
 msgstr "Код активації, що буде введений користувачами"
 
-#: activation_codes/models.py:46
+#: activation_codes/models.py:45
 msgid "Code must be alphanumeric and contain no spaces or special characters"
 msgstr "Код має бути буквено-цифровим, без пробілів або спеціальних символів"
 
-#: activation_codes/models.py:52
+#: activation_codes/models.py:51
 msgid "maximum uses"
 msgstr "максимум використань"
 
-#: activation_codes/models.py:53
+#: activation_codes/models.py:52
 msgid "Maximum number of times this code can be used. 0 means unlimited."
 msgstr "Максимальна кількість разів використання для цього коду. 0 - необмежена."
 
-#: activation_codes/models.py:58
+#: activation_codes/models.py:57
 msgid "current uses"
 msgstr "використано"
 
-#: activation_codes/models.py:59
+#: activation_codes/models.py:58
 msgid "Number of times this code has been used"
 msgstr "Кількість разів використання цього коду"
 
-#: activation_codes/models.py:65 core/models.py:156 core/models.py:377
+#: activation_codes/models.py:64 core/models.py:156 core/models.py:406
 msgid "active"
 msgstr "активний"
 
-#: activation_codes/models.py:66
+#: activation_codes/models.py:65
 msgid "Whether this code can still be used"
 msgstr "Чи цей код все ще може бути використаний"
 
-#: activation_codes/models.py:71
+#: activation_codes/models.py:70
 msgid "expires at"
 msgstr "дійсний до"
 
-#: activation_codes/models.py:72
+#: activation_codes/models.py:71
 msgid "Date and time when this code expires"
 msgstr "Дата та час, коли закінчується дія цього коду"
 
-#: activation_codes/models.py:78
+#: activation_codes/models.py:77
 msgid "description"
 msgstr "опис"
 
-#: activation_codes/models.py:79
+#: activation_codes/models.py:78
 msgid "Internal description or notes about this code"
 msgstr "Внутрішній опис або нотатки про цей код"
 
-#: activation_codes/models.py:86
+#: activation_codes/models.py:85
 msgid "activation codes"
 msgstr "коди активації"
 
-#: activation_codes/models.py:128
-msgid "This activation code is no longer valid"
-msgstr "Цей код активації вже не дійсний"
-
-#: activation_codes/models.py:136
-msgid "You have already activated your account"
-msgstr "Ви вже активували свій обліковий запис"
-
-#: activation_codes/models.py:170 activation_codes/models.py:202
+#: activation_codes/models.py:100 activation_codes/models.py:132
 #: core/models.py:195
 msgid "user"
 msgstr "користувач"
 
-#: activation_codes/models.py:171
+#: activation_codes/models.py:101
 msgid "The user who used the activation code"
 msgstr "Користувач, який користувався кодом активації"
 
-#: activation_codes/models.py:179
+#: activation_codes/models.py:109
 msgid "The activation code that was used"
 msgstr "Використаний код активації"
 
-#: activation_codes/models.py:186 activation_codes/models.py:210
+#: activation_codes/models.py:116 activation_codes/models.py:140
 msgid "user activation"
 msgstr "активація користувача"
 
-#: activation_codes/models.py:187
+#: activation_codes/models.py:117
 msgid "user activations"
 msgstr "активації користувача"
 
-#: activation_codes/models.py:203
+#: activation_codes/models.py:133
 msgid "The user who made the registration request"
 msgstr "Користувач, що зробив запит на реєстрацію"
 
-#: activation_codes/models.py:211
+#: activation_codes/models.py:141
 msgid "Store if the user received an activation code and used it"
 msgstr "Зберегти, якщо користувач отримав код активації та використав його"
 
-#: activation_codes/models.py:220
+#: activation_codes/models.py:150
 msgid "user registration request"
 msgstr "запит на реєстрацію користувача"
 
-#: activation_codes/models.py:221
+#: activation_codes/models.py:151
 msgid "user registration requests"
 msgstr "запити на реєстрацію користувачів"
 
-#: activation_codes/serializers.py:14
-msgid "The activation code to validate"
-msgstr "Код активації для перевірки"
+#: chat/agent_rag/document_converter/guards.py:61
+msgid "Document expands beyond the allowed size and was rejected."
+msgstr "Документ перевищує дозволений ліміт розміру і був відхилений."
 
-#: activation_codes/viewsets.py:107
-msgid "Your account has been successfully activated"
-msgstr "Ваш обліковий запис успішно активовано"
+#: chat/agent_rag/document_converter/guards.py:73
+msgid "Document has a suspicious compression ratio and was rejected."
+msgstr "Документ має підозрілий коефіцієнт стиснення, тому був відхилений."
+
+#: chat/agent_rag/document_converter/guards.py:98
+msgid "Document has too many pages and was rejected."
+msgstr "Документ має забагато сторінок і був відхилений."
 
 #: chat/agent_rag/document_converter/odt.py:30
 #, python-format
@@ -243,53 +204,58 @@ msgstr "Служба недоступна"
 msgid "The service is currently unavailable due to excessive load. The team is working to restore the Assistant as quickly as possible."
 msgstr "Сервіс наразі недоступний через надмірне навантаження. Команда працює над якомога швидше відновлення роботи Помічника."
 
-#: chat/clients/pydantic_ai.py:1000
+#: chat/clients/pydantic_ai.py:1367
 msgid "Internal Documentation of the AI Assistant"
 msgstr "Внутрішня документація помічника ШІ"
 
-#: chat/views/__init__.py:740
+#: chat/views/attachments.py:305
 #, python-format
 msgid "This project already has the maximum of %(cap)d images. Remove one before uploading another."
 msgstr "Цей проект вже досяг максимальної кількості у %(cap)d зображень. Видаліть одне, перш ніж завантажувати інше."
 
-#: chat/views/__init__.py:756
+#: chat/views/attachments.py:321
 #, python-format
 msgid "This project already has the maximum of %(cap)d files. Remove one before uploading another."
 msgstr "Цей проект вже досяг максимальної кількості у %(cap)d файлів. Видаліть один, перш ніж завантажувати інший."
 
-#: core/admin.py:29
+#: chat/views/edit_in_docs.py:37
+#, python-format
+msgid "[L'Assistant] New document %(date)s"
+msgstr "[L'Assistant] Новий документ %(date)s"
+
+#: core/admin.py:30
 msgid "Personal info"
 msgstr "Особисті дані"
 
-#: core/admin.py:45
+#: core/admin.py:46
 msgid "Permissions"
 msgstr "Дозволи"
 
-#: core/admin.py:57
+#: core/admin.py:58
 msgid "Important dates"
 msgstr "Важливі дати"
 
-#: core/admin.py:138
+#: core/admin.py:155
 msgid "Self documentation"
 msgstr "Вбудована документація"
 
-#: core/admin.py:141
+#: core/admin.py:158
 msgid "Markdown documentation about this service. Exposed to the conversation agent so it can answer questions users ask about the app itself."
 msgstr "Документація Markdown про цей сервіс. Використовується для розмовного агента, щоб він міг відповісти на питання, які користувачі задають про нього самого."
 
-#: core/admin.py:149
+#: core/admin.py:166
 msgid "Status banner"
 msgstr "Індикатор стану"
 
-#: core/admin.py:152
+#: core/admin.py:169
 msgid "Shown to all users at the top of the app. Leave title and content empty to disable."
 msgstr "Показується всім користувачам зверху додатку. Залиште заголовок та вміст порожнім, щоб вимкнути."
 
-#: core/admin.py:165
+#: core/admin.py:182
 msgid "Assistant"
 msgstr "Помічник"
 
-#: core/admin.py:189
+#: core/admin.py:206
 msgid "The MAINTENANCE_MODE environment variable is set: maintenance is forced ON regardless of the value below."
 msgstr "Змінна середовища MAINTENANCE_MODE встановлена: технічне обслуговування змушене незалежно від значення нижче."
 
@@ -501,39 +467,39 @@ msgstr "Якщо встановлено, обслуговування неакт
 msgid "Maintenance Mode"
 msgstr "Режим обслуговування"
 
-#: core/models.py:372
+#: core/models.py:401
 msgid "email address"
 msgstr "електронна адреса"
 
-#: core/models.py:374
+#: core/models.py:403
 msgid "email address allowed to bypass the role requirement"
 msgstr "адреса електронної пошти, якій дозволено обхід вимог ролі"
 
-#: core/models.py:379
+#: core/models.py:408
 msgid "inactive entries are ignored without being deleted"
 msgstr "неактивні записи ігноруються без видалення"
 
-#: core/models.py:382
+#: core/models.py:411
 msgid "note"
 msgstr "нотатка"
 
-#: core/models.py:384
+#: core/models.py:413
 msgid "optional reason for granting this bypass"
 msgstr "необов'язкова причина для надання цього обходу"
 
-#: core/models.py:387
+#: core/models.py:416
 msgid "expires on"
 msgstr "термін дії до"
 
-#: core/models.py:390
+#: core/models.py:419
 msgid "optional date after which this bypass no longer applies"
 msgstr "необов'язкова дата, після якої цей обхід більше не застосовується"
 
-#: core/models.py:395
+#: core/models.py:424
 msgid "access bypass email"
 msgstr "електронна поштова адреса для обходу"
 
-#: core/models.py:396
+#: core/models.py:425
 msgid "access bypass emails"
 msgstr "електронні поштові адреси для обходу"
 

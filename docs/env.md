@@ -17,13 +17,16 @@ These are the environment variables you can set for the `conversations-backend` 
 | DB_HOST                                         | host of the database                                                                                                              | localhost                                               |
 | DB_PORT                                         | port of the database                                                                                                              | 5432                                                    |
 | MEDIA_BASE_URL                                  |                                                                                                                                   |                                                         |
-| STORAGES_STATICFILES_BACKEND                    |                                                                                                                                   | whitenoise.storage.CompressedManifestStaticFilesStorage |
+| STORAGES_STATICFILES_BACKEND                    |                                                                                                                                   | servestatic.storage.CompressedManifestStaticFilesStorage |
 | AWS_S3_ENDPOINT_URL                             | S3 endpoint                                                                                                                       |                                                         |
 | AWS_S3_ACCESS_KEY_ID                            | access id for s3 endpoint                                                                                                         |                                                         |
 | AWS_S3_SECRET_ACCESS_KEY                        | access key for s3 endpoint                                                                                                        |                                                         |
 | AWS_S3_REGION_NAME                              | region name for s3 endpoint                                                                                                       |                                                         |
 | AWS_STORAGE_BUCKET_NAME                         | bucket name for s3 endpoint                                                                                                       | conversations-media-storage                             |
 | ATTACHMENT_MAX_SIZE                             | maximum size of document in bytes                                                                                                 | 10485760                                                |
+| ATTACHMENT_PARSE_MAX_UNCOMPRESSED_SIZE          | max declared uncompressed size (bytes) for a ZIP-container document (DOCX/XLSX/PPTX/ODT); rejects decompression bombs before parse | 209715200                                               |
+| ATTACHMENT_PARSE_MAX_COMPRESSION_RATIO          | max uncompressed/compressed ratio for a ZIP-container document; rejects suspiciously compressible decompression bombs             | 100                                                     |
+| ATTACHMENT_PARSE_MAX_PDF_PAGES                  | max page count for an in-process PDF parse (AdaptivePdfParser); caps the per-page extract loop                                     | 2000                                                    |
 | PROJECT_FILES_MAX_COUNT                         | max non-image attachments per project (companion markdown rows excluded). Bounds per-turn system-prompt token cost.               | 10                                                      |
 | PROJECT_IMAGES_MAX_COUNT                        | max image attachments per project. Every image is pinned to every conversation turn; bounds vision-token cost and provider caps.   | 3                                                       |
 | LANGUAGE_CODE                                   | default language                                                                                                                  | en-us                                                   |
@@ -49,10 +52,16 @@ These are the environment variables you can set for the `conversations-backend` 
 | FRONTEND_SILENT_LOGIN_ENABLED                   | frontend fsilent login enabled                                                                                                    | false                                                   |
 | FRONTEND_THEME                                  | frontend theme to use                                                                                                             |                                                         |
 | POSTHOG_KEY                                     | posthog key for analytics                                                                                                         |                                                         |
-| DJANGO_CELERY_BROKER_URL                        | celery broker url                                                                                                                 | redis://redis:6379/0                                    |
-| DJANGO_CELERY_BROKER_TRANSPORT_OPTIONS          | celery broker transport options                                                                                                   | {}                                                      |
+| CELERY_BROKER_URL                               | celery broker url                                                                                                                 | redis://redis:6379/0                                    |
+| CELERY_RESULT_BACKEND                           | celery result backend url (stores results for tasks the request awaits, e.g. conversation document parsing)                       | redis://redis:6379/0                                    |
+| CELERY_RESULT_EXPIRES                           | how long unconsumed task results stay in redis, in seconds                                                                        | 3600                                                    |
+| CELERY_BROKER_TRANSPORT_OPTIONS                 | celery broker transport options                                                                                                   | {}                                                      |
+| CELERY_TASK_ROUTES                              | maps task names to queues so heavy and fast tasks can run on separate workers ({} = default queue)                                | {}                                                      |
+| CELERY_TASK_SOFT_TIME_LIMIT                     | celery soft per-task time limit in seconds (raises SoftTimeLimitExceeded; recorded as a failed parse)                             | 180                                                     |
+| CELERY_TASK_TIME_LIMIT                          | celery hard per-task time limit in seconds (SIGKILLs the worker child)                                                            | 300                                                     |
+| DOCUMENT_PARSE_RESULT_TIMEOUT_SECONDS           | max seconds a chat turn waits for the conversation document-parse task result before failing the turn                             | 360                                                     |
 | SESSION_COOKIE_AGE                              | duration of the cookie session                                                                                                    | 60*60*12                                                |
-| OIDC_CREATE_USER                                | create used on OIDC                                                                                                               | false                                                   |
+| OIDC_CREATE_USER                                | create user on OIDC                                                                                                               | true                                                    |
 | OIDC_RP_SIGN_ALGO                               | verification algorithm used OIDC tokens                                                                                           | RS256                                                   |
 | OIDC_RP_CLIENT_ID                               | client id used for OIDC                                                                                                           | conversations                                           |
 | OIDC_RP_CLIENT_SECRET                           | client secret used for OIDC                                                                                                       |                                                         |
@@ -79,6 +88,10 @@ These are the environment variables you can set for the `conversations-backend` 
 | LLM_CONFIGURATION_FILE_PATH                     | Path to the LLM configuration JSON file. See [LLM Configuration](llm-configuration.md) for details                                | <BASE_DIR>/conversations/configuration/llm/default.json |
 | LLM_DEFAULT_MODEL_HRID                          | HRID of the model used for conversations                                                                                          | default-model                                           |
 | LLM_SUMMARIZATION_MODEL_HRID                    | HRID of the model used for summarization                                                                                          | default-summarization-model                             |
+| DOCUMENT_CONTEXT_BUDGET_RATIO                   | Fraction of `max_token_context` for inlined conversation documents; `(1 - ratio)` is the conversation history share that gates summarization (security buffer subtracted from each afterwards). One knob, two mechanisms - they cannot be tuned independently. See [attachments.md](attachments.md) | `0.5`                                                   |
+| DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS         | Tokens subtracted from each of the document and history budgets independently                                                              | `1000`                                                  |
+| CONVERSATION_SUMMARY_CONTEXT_MESSAGES           | Target `ModelMessage` count kept after a conversation summary; up to one complete turn more when the window is aligned to a user message, fewer when over the history budget (use an even value). See [attachments.md](attachments.md) | `10`                                                    |
+| CONVERSATION_SUMMARY_MAX_TOKENS                 | Max tokens for the conversation summarization LLM output                                                                                        | `2048`                                                  |
 | AI_API_KEY                                      | AI API key to be used for the default provider (used in default LLM configuration, not for production use)                        |                                                         |
 | AI_BASE_URL                                     | OpenAI compatible AI base URL (used in default LLM configuration, not for production use)                                         |                                                         |
 | AI_MODEL                                        | AI Model name to use (used in default LLM configuration, not for production use)                                                  |                                                         |
@@ -96,34 +109,55 @@ These are the environment variables you can set for the `conversations-backend` 
 | CACHES_KEY_PREFIX                               | The prefix used to every cache keys.                                                                                              | conversations                                           |
 | THEME_CUSTOMIZATION_FILE_PATH                   | full path to the file customizing the theme. An example is provided in src/backend/conversations/configuration/theme/default.json | BASE_DIR/conversations/configuration/theme/default.json |
 | THEME_CUSTOMIZATION_CACHE_TIMEOUT               | Cache duration for the customization settings                                                                                     | 86400                                                   |
-| FIND_API_KEY                                    | API key of Find                                                                                                                   |                                                         |
-| FIND_API_URL                                    | URL of Find                                                                                                                       | `https://app-find/api`                                  |
-| FIND_API_TIMEOUT                                | Find API timeout                                                                                                                  | 30                                                      |
-| ACTIVATION_REQUIRED                             | Require users to redeem an activation code before using the app (post-login gate). See "Access control modes" below.              | False                                                   |
+| DOCS_BASE_URL                                   | Base URL of the La Suite Docs instance. Enables the "Edit in Docs" feature (the button only appears when set). Requires `OIDC_STORE_ACCESS_TOKEN=true`. See [Interoperability](interoperabilities.md). |                                                         |
+| DOCS_API_TIMEOUT                                | Timeout (seconds) for HTTP calls to the Docs external API                                                                          | 30                                                      |
 | OIDC_ALLOWED_ROLES                              | Comma-separated roles; restrict login to users whose OIDC `roles` claim contains one of them. Empty disables. See "Access control modes" below. | [] (empty, disabled)                                    |
+| API_ATTACHMENT_UPLOAD_THROTTLE_RATE             | Rate limit on the attachment upload endpoint, per user                                                                            | 60/minute                                               |
+| API_ATTACHMENT_AUTH_THROTTLE_RATE               | Rate limit on the attachment authorization endpoint, per user                                                                     | 60/minute                                               |
+| API_FILE_STREAM_THROTTLE_RATE                   | Rate limit on the file streaming endpoint, per user                                                                               | 60/minute                                               |
+| API_CONVERSATION_CREATE_HOURLY_THROTTLE_RATE    | Hourly limit on conversation creation, per user. See [Rate limiting](#rate-limiting)                                              | 20/hour                                                 |
+| API_CONVERSATION_CREATE_DAILY_THROTTLE_RATE     | Daily limit on conversation creation, per user. See [Rate limiting](#rate-limiting)                                               | 100/day                                                 |
+| API_PROJECT_CREATE_HOURLY_THROTTLE_RATE         | Hourly limit on project creation, per user. See [Rate limiting](#rate-limiting)                                                   | 10/hour                                                 |
+| API_PROJECT_CREATE_DAILY_THROTTLE_RATE          | Daily limit on project creation, per user. See [Rate limiting](#rate-limiting)                                                    | 100/day                                                 |
 
 
-## Access control modes
+## Access control
 
-Access can be gated in two mutually exclusive ways. Enable **one** of them; leave the other off.
+Access can be gated on the OIDC role claim:
 
-- **Activation codes** (`ACTIVATION_REQUIRED=True`): any authenticated user can sign
-  in, but must redeem a valid activation code before using the app. Codes are managed
-  in the Django admin (`activation_codes`).
 - **OIDC role** (`OIDC_ALLOWED_ROLES=<role>`): only users whose OIDC `roles` claim
   contains one of the listed roles can sign in; everyone else is redirected to the
   access-denied page. As a fallback, addresses on the access-bypass email allow-list
   (Django admin, *Access bypass emails*) are let in without the role. The role is
   re-checked on every login, so revoking it in the IdP blocks the user immediately.
+- **Open (no gate)**: leave `OIDC_ALLOWED_ROLES` empty (the default); any user the IdP
+  authenticates can sign in.
 
-| Mode             | `ACTIVATION_REQUIRED` | `OIDC_ALLOWED_ROLES`     |
-|------------------|-----------------------|--------------------------|
-| Activation codes | `True`                | empty                    |
-| OIDC role        | `False`               | e.g. `agent_public_etat` |
-| Open (no gate)   | `False`               | empty                    |
+The activation-code gate that used to be configured here has been removed. The
+`activation_codes` Django admin section survives read-only so past redemptions stay
+consultable.
 
-Setting both at once is not a supported configuration: a user would need the role to
-sign in *and* a redeemed code to use the app.
+
+## Rate limiting
+
+Conversation and project creation are each bounded by **two** limits at once, an
+hourly one and a daily one: both must allow a request for it to go through. A single
+rate cannot express both, and the two answer different questions - the hourly rate
+stops a runaway client or a retry loop, while the daily rate bounds how much a single
+account can accumulate in the database over time. Raising one without the other only
+moves the ceiling.
+
+Values use the Django REST framework format, `<number>/<period>`, where the period is
+one of `second`, `minute`, `hour` or `day`. Counting is per authenticated user and
+stored in Redis, so the limits hold across every backend replica.
+
+Only creation is limited. Reading conversations, renaming them and posting new messages
+to an existing one are unaffected, so a user who reaches the limit keeps full use of the
+conversations they already have and is only stopped from opening new ones (HTTP 429,
+with a `Retry-After` header).
+
+Rates are read when the process starts, so changing one of these variables takes effect
+on the next restart of the backend.
 
 
 ## conversations-frontend image
@@ -140,13 +174,13 @@ Example:
 docker build -f src/frontend/Dockerfile --target frontend-production --build-arg API_ORIGIN=https://mybackend.example.com conversations-frontend:latest
 ``` 
 
-If you want to build the front-end application using the yarn build command, you can edit the file `src/frontend/apps/conversations/.env` with the `NODE_ENV=production` environment variable and modify it. Alternatively, you can use the listed environment variables with the prefix `NEXT_PUBLIC_`.
+If you want to build the front-end application using the yarn build command, you can edit the file `src/frontend/apps/conversations/.env` with the `NODE_ENV=production` environment variable and modify it. Alternatively, you can use the listed environment variables with the prefix `VITE_`.
 
 Example:
 
 ```
 cd src/frontend/apps/conversations
-NODE_ENV=production NEXT_PUBLIC_API_ORIGIN=https://mybackend.example.com yarn build
+VITE_API_ORIGIN=https://mybackend.example.com yarn build
 ```
 
 | Option                                          | Description                                                                        | default                                                 |

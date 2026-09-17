@@ -176,11 +176,13 @@ Additional documentation is available in the `docs/` directory:
 
 - [LLM Configuration](docs/llm-configuration.md) - Configure Large Language Models and providers
 - [Attachments](docs/attachments.md) - How to use attachments in conversations
+- [Project File Indexing](docs/project-file-indexing.md) - Async RAG indexing lifecycle, retries, and failure handling for project files
 - [Tools for Agents](docs/tools.md) - Available tools and how to add new ones
 - [Environment Variables](docs/env.md) - All available environment variables
 - [Installation Guide](docs/installation.md) - Deploy on a Kubernetes cluster
 - [Theming](docs/theming.md) - Customize the application appearance
 - [Architecture](docs/architecture.md) - Technical architecture overview
+- [Celery](docs/celery.md) - Background tasks with Celery and Redis
 
 
 ## Licence 📝
@@ -212,7 +214,7 @@ docs
 
 ### Stack
 
-Conversations is built on top of [Django Rest Framework](https://www.django-rest-framework.org/), [Next.js](https://nextjs.org/), [Vercel&lsquo;s AI SDK](https://ai-sdk.dev/) and [Pydantic AI](https://ai.pydantic.dev). We thank the contributors of all these projects for their awesome work!
+Conversations is built on top of [Django Rest Framework](https://www.django-rest-framework.org/), [Vite](https://vite.dev/), [Vercel&lsquo;s AI SDK](https://ai-sdk.dev/) and [Pydantic AI](https://ai.pydantic.dev). We thank the contributors of all these projects for their awesome work!
 
 
 ### Gov ❤️ open source

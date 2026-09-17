@@ -1,10 +1,9 @@
-import { useRouter } from 'next/router';
 import { PropsWithChildren } from 'react';
+import { Navigate, useLocation } from 'react-router';
 
 import { Box, Loader } from '@/components';
 import { useConfig } from '@/core';
 
-import { useActivationStatus } from '../api/useActivationStatus';
 import { HOME_URL } from '../conf';
 import { useAuth } from '../hooks';
 import { attemptSilentLogin, canAttemptSilentLogin } from '../silentLogin';
@@ -13,10 +12,11 @@ import { getAuthUrl, gotoLogin } from '../utils';
 export const Auth = ({ children }: PropsWithChildren) => {
   const { isLoading, pathAllowed, isFetchedAfterMount, authenticated } =
     useAuth();
-  const { replace, pathname } = useRouter();
+  const { pathname } = useLocation();
+  // The router reports the real URL, which may carry the trailing slash the
+  // Next export used to add; the comparisons below are exact.
+  const path = pathname.replace(/\/+$/, '') || '/';
   const { data: config, isLoading: isConfigLoading } = useConfig();
-  const { data: activationStatus, isLoading: isActivationLoading } =
-    useActivationStatus();
 
   if (isLoading && !isFetchedAfterMount) {
     return (
@@ -33,12 +33,7 @@ export const Auth = ({ children }: PropsWithChildren) => {
   if (authenticated) {
     const authUrl = getAuthUrl();
     if (authUrl) {
-      void replace(authUrl);
-      return (
-        <Box $height="100vh" $width="100vw" $align="center" $justify="center">
-          <Loader />
-        </Box>
-      );
+      return <Navigate to={authUrl} replace />;
     }
   }
 
@@ -57,7 +52,7 @@ export const Auth = ({ children }: PropsWithChildren) => {
     if (config?.FRONTEND_SILENT_LOGIN_ENABLED && canAttemptSilentLogin()) {
       attemptSilentLogin(30);
     } else if (config?.FRONTEND_HOMEPAGE_FEATURE_ENABLED) {
-      void replace(HOME_URL);
+      return <Navigate to={HOME_URL} replace />;
     } else {
       gotoLogin();
     }
@@ -71,42 +66,8 @@ export const Auth = ({ children }: PropsWithChildren) => {
   /**
    * If the user is authenticated and the path is the home page, we redirect to the index.
    */
-  if (pathname === HOME_URL && authenticated) {
-    void replace('/');
-    return (
-      <Box $height="100vh" $width="100vw" $align="center" $justify="center">
-        <Loader />
-      </Box>
-    );
-  }
-
-  /**
-   * Activation check: If user is authenticated, config requires activation, and user is not activated,
-   * redirect to activation page (unless already on activation page).
-   */
-  if (
-    authenticated &&
-    config?.ACTIVATION_REQUIRED &&
-    pathname !== '/activation'
-  ) {
-    // Show loading while checking activation status
-    if (isActivationLoading) {
-      return (
-        <Box $height="100vh" $width="100vw" $align="center" $justify="center">
-          <Loader />
-        </Box>
-      );
-    }
-
-    // If activation is required but user is not activated, redirect to activation page
-    if (activationStatus && !activationStatus.is_activated) {
-      void replace('/activation');
-      return (
-        <Box $height="100vh" $width="100vw" $align="center" $justify="center">
-          <Loader />
-        </Box>
-      );
-    }
+  if (path === HOME_URL && authenticated) {
+    return <Navigate to="/" replace />;
   }
 
   return children;

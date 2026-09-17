@@ -1,13 +1,12 @@
-import Image from 'next/image';
 import { useTranslation } from 'react-i18next';
 
-import Logo from '@/assets/logo/logo-ai.svg';
+import Logo from '@/assets/logo/logo-ai.svg?react';
 import { Box } from '@/components';
 import { productName } from '@/core';
 import { useCunninghamTheme } from '@/cunningham';
 import { ButtonLogin } from '@/features/auth/components/ButtonLogin';
 import { Feedback } from '@/features/feedback/Feedback';
-import { LaGaufre } from '@/features/header/components/LaGaufre';
+import { AppSwitcher } from '@/features/header/components/AppSwitcher';
 import { LanguagePicker } from '@/features/language';
 import { useResponsiveStore } from '@/stores';
 
@@ -25,7 +24,7 @@ export const HomeHeader = () => {
   const logo = (componentTokens as Record<string, unknown>).logo as
     | { src: string; alt: string; widthHeader: string; widthFooter: string }
     | undefined;
-  const showLaGaufre =
+  const showAppSwitcher =
     (componentTokens as Record<string, unknown>)['la-gaufre'] === true;
 
   return (
@@ -47,12 +46,9 @@ export const HomeHeader = () => {
         $justify="center"
       >
         {!isSmallMobile && logo?.src && (
-          <Image
-            priority
+          <img
             src={logo.src}
             alt={logo.alt}
-            width={0}
-            height={0}
             style={{ width: logo.widthHeader, height: 'auto' }}
           />
         )}
@@ -77,7 +73,7 @@ export const HomeHeader = () => {
         {!isSmallMobile && (
           <LanguagePicker color="brand" size="medium" compact={false} />
         )}
-        {showLaGaufre && <LaGaufre />}
+        {showAppSwitcher && <AppSwitcher />}
       </Box>
     </Box>
   );

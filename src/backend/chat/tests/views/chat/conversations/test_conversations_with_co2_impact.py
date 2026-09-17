@@ -17,6 +17,15 @@ pytestmark = pytest.mark.django_db(transaction=True)
 EXPECTED_CO2_IMPACT = 1e-05
 
 
+def _extract_message_metadata(response_content: str) -> list:
+    """Parse the metadata carried by the `finish` frames of a UI message stream."""
+    return [
+        json.loads(line.removeprefix("data: "))["messageMetadata"]
+        for line in response_content.splitlines()
+        if line.startswith('data: {"type":"finish"')
+    ]
+
+
 @pytest.fixture(name="albert_settings", autouse=True)
 def albert_settings_fixture(settings):
     """Configure Django settings to use the Albert LLM provider."""
@@ -46,7 +55,7 @@ def albert_conversation_fixture(api_client):
     """Create an Albert-backed conversation and return (conversation, url)
     with the client logged in."""
     chat_conversation = ChatConversationFactory(owner__language="en-us")
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
     api_client.force_login(chat_conversation.owner)
     return chat_conversation, url
 
@@ -91,13 +100,13 @@ def _make_stream(with_co2: bool) -> str:
 
 @freeze_time("2025-07-25T10:36:35.297675Z")
 @respx.mock
-def test_albert_co2_impact_appears_in_annotations_and_stream(
+def test_albert_co2_impact_appears_in_metadata_and_stream(
     api_client,
     mock_openai_stream_multi_calls,
     albert_conversation,
 ):
     """
-    CO2 impact from Albert API is stored in messages[1].annotations in the database
+    CO2 impact from Albert API is stored in messages[1].metadata in the database
     and accumulated in agent_usage across turns.
     """
     chat_conversation, url = albert_conversation
@@ -117,12 +126,16 @@ def test_albert_co2_impact_appears_in_annotations_and_stream(
     response_content = b"".join(response.streaming_content).decode("utf-8")
     assert response_content
     assert mock_openai_stream_multi_calls.called
+    # The CO2 impact is streamed so the live message shows it without a reload
+    assert [metadata["co2_impact"] for metadata in _extract_message_metadata(response_content)] == [
+        pytest.approx(EXPECTED_CO2_IMPACT)
+    ]
     chat_conversation.refresh_from_db()
 
-    # Verify the assistant message carries the CO2 annotation in the DB
-    assert chat_conversation.messages[1].annotations == [
-        {"co2_impact": pytest.approx(EXPECTED_CO2_IMPACT)}
-    ]
+    # Verify the assistant message carries the CO2 impact in the DB
+    assert chat_conversation.messages[1].metadata == {
+        "co2_impact": pytest.approx(EXPECTED_CO2_IMPACT)
+    }
     assert chat_conversation.agent_usage["co2_impact"] == pytest.approx(EXPECTED_CO2_IMPACT)
 
     # Add new User message to trigger another assistant response and verify
@@ -153,11 +166,15 @@ def test_albert_co2_impact_appears_in_annotations_and_stream(
 
     second_response_content = b"".join(second_response.streaming_content).decode("utf-8")
     assert second_response_content
-    # Verify CO2 annotation appears on the new assistant message
+    # The streamed metadata carries this turn's impact, not the cumulative total
+    assert [
+        metadata["co2_impact"] for metadata in _extract_message_metadata(second_response_content)
+    ] == [pytest.approx(EXPECTED_CO2_IMPACT)]
+    # Verify the CO2 impact appears on the new assistant message
     chat_conversation.refresh_from_db()
-    assert chat_conversation.messages[3].annotations == [
-        {"co2_impact": pytest.approx(EXPECTED_CO2_IMPACT)}
-    ]
+    assert chat_conversation.messages[3].metadata == {
+        "co2_impact": pytest.approx(EXPECTED_CO2_IMPACT)
+    }
     # agent_usage is the sum of each request usage
     assert chat_conversation.agent_usage["co2_impact"] == pytest.approx(2 * EXPECTED_CO2_IMPACT)
 
@@ -207,9 +224,9 @@ def test_albert_co2_impact_preserved_when_second_request_has_no_co2(
     assert b"".join(response.streaming_content).decode("utf-8")
     chat_conversation.refresh_from_db()
 
-    assert chat_conversation.messages[1].annotations == [
-        {"co2_impact": pytest.approx(EXPECTED_CO2_IMPACT)}
-    ]
+    assert chat_conversation.messages[1].metadata == {
+        "co2_impact": pytest.approx(EXPECTED_CO2_IMPACT)
+    }
     assert chat_conversation.agent_usage["co2_impact"] == pytest.approx(EXPECTED_CO2_IMPACT)
 
     # Second request — Albert returns NO CO2 data
@@ -234,10 +251,16 @@ def test_albert_co2_impact_preserved_when_second_request_has_no_co2(
         ]
     }
     second_response = api_client.post(url, second_data, format="json")
-    assert b"".join(second_response.streaming_content).decode("utf-8")
+    second_response_content = b"".join(second_response.streaming_content).decode("utf-8")
+    assert second_response_content
+    # No CO2 from the API means no co2_impact in the streamed metadata either
+    assert all(
+        "co2_impact" not in metadata
+        for metadata in _extract_message_metadata(second_response_content)
+    )
     chat_conversation.refresh_from_db()
 
-    # New assistant message should have no CO2 annotation (none returned by API)
-    assert chat_conversation.messages[3].annotations in (None, [])
+    # New assistant message should have no CO2 metadata (none returned by API)
+    assert not chat_conversation.messages[3].metadata
     # agent_usage must still carry the CO2 from the first request — not reset to zero
     assert chat_conversation.agent_usage["co2_impact"] == pytest.approx(EXPECTED_CO2_IMPACT)

@@ -8,9 +8,9 @@ project carrying indexed RAG files. They exercise:
 """
 
 import json
-from unittest import mock
+from datetime import timedelta
 
-from django.contrib.sessions.backends.cache import SessionStore
+from django.utils import timezone
 
 import pytest
 import respx
@@ -23,6 +23,7 @@ from rest_framework import status
 from core.file_upload.enums import AttachmentStatus
 
 from chat.constants import ACCESS_FULL_CONTEXT
+from chat.enums import AttachmentIndexState
 from chat.factories import (
     ChatConversationAttachmentFactory,
     ChatConversationFactory,
@@ -38,28 +39,8 @@ pytestmark = pytest.mark.django_db(transaction=True)
 @pytest.fixture(autouse=True)
 def ai_settings(settings):
     """Albert backend + LLM settings, mirroring the document_upload test fixture."""
-    settings.RAG_DOCUMENT_SEARCH_BACKEND = (
-        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend"
-    )
-    settings.RAG_DOCUMENT_PARSER = "chat.agent_rag.document_converter.parser.AlbertParser"
-    settings.AI_BASE_URL = "https://www.external-ai-service.com/"
-    settings.AI_API_KEY = "test-api-key"
-    settings.AI_MODEL = "test-model"
     settings.AI_AGENT_INSTRUCTIONS = "You are a helpful test assistant :)"
-    settings.ALBERT_API_URL = "https://albert.api.etalab.gouv.fr"
-    settings.ALBERT_API_KEY = "albert-api-key"
     return settings
-
-
-@pytest.fixture(name="mock_refresh_access_token", autouse=True)
-def mock_refresh_access_token_fixture():
-    """Bypass OIDC token refresh (same pattern as the document_upload tests)."""
-
-    with mock.patch("utils.oidc.refresh_access_token") as mocked:
-        session = SessionStore()
-        session["oidc_access_token"] = "mocked-access-token"
-        mocked.return_value = session
-        yield mocked
 
 
 ASK_DOC_MESSAGE = {
@@ -142,8 +123,8 @@ def test_post_conversation_searches_project_collection(
 
     assert search_mock.call_count == 1
     payload = json.loads(search_mock.calls[0].request.content)
-    assert payload["collections"] == [22]
-    assert payload["prompt"] == "What does the project doc say?"
+    assert payload["collection_ids"] == [22]
+    assert payload["query"] == "What does the project doc say?"
 
 
 @respx.mock
@@ -191,7 +172,7 @@ def test_post_conversation_searches_both_collections_when_conversation_has_own(
     response_text = b"".join(response.streaming_content).decode("utf-8")
     assert search_mock.call_count > 0, f"search not called. response: {response_text!r}"
     payload = json.loads(search_mock.calls[0].request.content)
-    assert sorted(payload["collections"]) == [11, 22]
+    assert sorted(payload["collection_ids"]) == [11, 22]
 
 
 @pytest.fixture(name="inlineable_llm_config")
@@ -202,7 +183,6 @@ def _inlineable_llm_config_fixture(settings):
     document to `tool_call_only`. Override with a 4000-token model and a 0.5
     budget ratio so a tiny conversation attachment lands as ACCESS_FULL_CONTEXT.
     """
-    settings.DOCUMENT_CONTEXT_BUDGET_RATIO = 0.5
     settings.DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS = 0
     settings.LLM_CONFIGURATIONS = {
         "default-model": LLModel(
@@ -297,7 +277,7 @@ def test_post_conversation_inlines_convo_doc_while_project_doc_stays_rag_only(
     # Project doc still searched via the RAG tool against project collection.
     assert search_mock.call_count == 1
     payload = json.loads(search_mock.calls[0].request.content)
-    assert payload["collections"] == [22]
+    assert payload["collection_ids"] == [22]
 
     # Convo doc reached the system prompt as inlined full context.
     assert captured_instructions, "agent_model never received instructions"
@@ -311,6 +291,147 @@ def test_post_conversation_inlines_convo_doc_while_project_doc_stays_rag_only(
     assert set(docs_by_title) == {"note.md"}
     assert docs_by_title["note.md"]["access"] == ACCESS_FULL_CONTEXT
     assert "The conversation note says hello." in docs_by_title["note.md"]["content"]
+
+
+def test_post_conversation_blocked_while_project_file_scanning(api_client):
+    """A project file still being malware-scanned blocks the message with 409.
+
+    The scan is the only in-flight state that blocks: its content must not reach
+    the model before the scan clears it. Indexing does not block (see
+    `test_post_conversation_not_blocked_while_project_file_indexing`).
+    """
+    project = ChatProjectFactory(collection_id="22")
+    ChatProjectAttachmentFactory(
+        project=project,
+        content_type="text/plain",
+        upload_state=AttachmentStatus.ANALYZING,
+        index_state=AttachmentIndexState.NOT_INDEXED,
+    )
+    conversation = ChatConversationFactory(owner=project.owner, project=project)
+    api_client.force_authenticate(user=conversation.owner)
+
+    response = api_client.post(
+        f"/api/v1.0/chats/{conversation.pk}/conversation/",
+        data={"messages": [ASK_DOC_MESSAGE]},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json() == {"error": "project_files_indexing"}
+
+
+@respx.mock
+@freeze_time("2025-07-25T10:36:35.297675Z")
+def test_post_conversation_not_blocked_by_stale_scanning_file(
+    api_client,
+    settings,
+    hello_conversation_data,
+    mock_ai_agent_service,
+):
+    """A row stuck in ANALYZING past the window must not deadlock messaging.
+
+    The scan runs off-process and reports back via callback. If it exhausts its
+    retries or the worker dies, the callback never fires and the row stays
+    ANALYZING forever, which would block every message in the project for good.
+    Once `updated_at` is older than the cutoff the gate stops blocking on it.
+    """
+    project = ChatProjectFactory(collection_id=None)
+    attachment = ChatProjectAttachmentFactory(
+        project=project,
+        content_type="text/plain",
+        upload_state=AttachmentStatus.ANALYZING,
+        index_state=AttachmentIndexState.NOT_INDEXED,
+    )
+    # `updated_at` is auto_now, so bypass it with .update() to age the row past
+    # the cutoff (CELERY_TASK_TIME_LIMIT + 60s margin).
+    stale = timezone.now() - timedelta(seconds=settings.CELERY_TASK_TIME_LIMIT + 120)
+    type(attachment).objects.filter(pk=attachment.pk).update(updated_at=stale)
+
+    conversation = ChatConversationFactory(owner=project.owner, project=project)
+    api_client.force_authenticate(user=conversation.owner)
+
+    def agent_model(_messages: list[ModelMessage], _info: AgentInfo):
+        return ModelResponse(parts=[TextPart(content="Hello there")])
+
+    with mock_ai_agent_service(FunctionModel(function=agent_model)):
+        response = api_client.post(
+            f"/api/v1.0/chats/{conversation.pk}/conversation/",
+            data=hello_conversation_data,
+            format="json",
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+
+
+@respx.mock
+@freeze_time("2025-07-25T10:36:35.297675Z")
+def test_post_conversation_not_blocked_by_terminal_suspicious_file(
+    api_client,
+    hello_conversation_data,
+    mock_ai_agent_service,
+):
+    """A rejected (SUSPICIOUS) project file is terminal and must not block messages.
+
+    Guards against widening the gate to "not READY", which would deadlock the
+    project on terminal states (SUSPICIOUS, too-large) forever.
+    """
+    project = ChatProjectFactory(collection_id=None)
+    ChatProjectAttachmentFactory(
+        project=project,
+        content_type="text/plain",
+        upload_state=AttachmentStatus.SUSPICIOUS,
+    )
+    conversation = ChatConversationFactory(owner=project.owner, project=project)
+    api_client.force_authenticate(user=conversation.owner)
+
+    def agent_model(_messages: list[ModelMessage], _info: AgentInfo):
+        return ModelResponse(parts=[TextPart(content="Hello there")])
+
+    with mock_ai_agent_service(FunctionModel(function=agent_model)):
+        response = api_client.post(
+            f"/api/v1.0/chats/{conversation.pk}/conversation/",
+            data=hello_conversation_data,
+            format="json",
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+
+
+@respx.mock
+@freeze_time("2025-07-25T10:36:35.297675Z")
+def test_post_conversation_not_blocked_while_project_file_indexing(
+    api_client,
+    hello_conversation_data,
+    mock_ai_agent_service,
+):
+    """A project file mid-indexing must not block messaging.
+
+    Indexing runs as a Celery task and can take a while, so the user is allowed
+    to send anyway (e.g. a quick question unrelated to the documents). The file
+    is simply not searchable yet; the frontend banner says so.
+    """
+    project = ChatProjectFactory(collection_id=None)
+    ChatProjectAttachmentFactory(
+        project=project,
+        content_type="text/plain",
+        upload_state=AttachmentStatus.READY,
+        index_state=AttachmentIndexState.INDEXING,
+    )
+
+    conversation = ChatConversationFactory(owner=project.owner, project=project)
+    api_client.force_authenticate(user=conversation.owner)
+
+    def agent_model(_messages: list[ModelMessage], _info: AgentInfo):
+        return ModelResponse(parts=[TextPart(content="Hello there")])
+
+    with mock_ai_agent_service(FunctionModel(function=agent_model)):
+        response = api_client.post(
+            f"/api/v1.0/chats/{conversation.pk}/conversation/",
+            data=hello_conversation_data,
+            format="json",
+        )
+
+    assert response.status_code == status.HTTP_200_OK
 
 
 @respx.mock

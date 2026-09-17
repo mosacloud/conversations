@@ -46,12 +46,7 @@ def _albert_chunk(content="snippet", document_name="doc.pdf", score=0.9):
 
 @pytest.fixture(name="albert_settings")
 def albert_settings_fixture(settings):
-    """Point the RAG backend setting + Albert API at deterministic test values."""
-    settings.RAG_DOCUMENT_SEARCH_BACKEND = (
-        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend"
-    )
-    settings.ALBERT_API_URL = "https://albert.test"
-    settings.ALBERT_API_KEY = "test-key"
+    """Expose the settings (Albert API defaults from Test) to build mock URLs."""
     return settings
 
 
@@ -298,7 +293,7 @@ async def test_search_uses_only_conversation_collection_when_no_project(albert_s
     await _tool_function()(_run_context(conversation, user), query="q")
 
     payload = json.loads(route.calls[0].request.content)
-    assert payload["collections"] == [11]
+    assert payload["collection_ids"] == [11]
 
 
 @pytest.mark.asyncio
@@ -317,7 +312,7 @@ async def test_search_includes_project_collection_when_set(albert_settings):
 
     payload = json.loads(route.calls[0].request.content)
     # Both collection ids land in the search payload (Albert casts to int).
-    assert sorted(payload["collections"]) == [11, 22]
+    assert sorted(payload["collection_ids"]) == [11, 22]
 
 
 @pytest.mark.asyncio
@@ -335,7 +330,7 @@ async def test_search_skips_project_collection_when_project_has_none(albert_sett
     await _tool_function()(_run_context(conversation, user), query="q")
 
     payload = json.loads(route.calls[0].request.content)
-    assert payload["collections"] == [11]
+    assert payload["collection_ids"] == [11]
 
 
 @pytest.mark.asyncio
@@ -353,7 +348,7 @@ async def test_search_uses_only_project_collection_when_conversation_has_none(al
     await _tool_function()(_run_context(conversation, user), query="q")
 
     payload = json.loads(route.calls[0].request.content)
-    assert payload["collections"] == [22]
+    assert payload["collection_ids"] == [22]
 
 
 @sync_to_async
@@ -428,7 +423,7 @@ async def test_document_id_resolves_against_project_attachments(albert_settings)
 
     payload = json.loads(route.calls[0].request.content)
     assert payload["document_ids"] == [555]
-    assert sorted(payload["collections"]) == [11, 22]
+    assert sorted(payload["collection_ids"]) == [11, 22]
 
 
 @pytest.mark.asyncio

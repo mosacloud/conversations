@@ -14,6 +14,7 @@ https://docs.djangoproject.com/en/3.1/ref/settings/
 import os
 import tomllib
 from socket import gethostbyname, gethostname
+from urllib.parse import urlparse
 
 from django.utils.functional import lazy
 
@@ -21,14 +22,22 @@ import posthog
 import sentry_sdk
 from configurations import Configuration, pristinemethod, values
 from corsheaders.defaults import default_headers
+from cryptography.fernet import Fernet
 from langfuse import Langfuse
 from sentry_sdk.integrations.django import DjangoIntegration
 from sentry_sdk.integrations.logging import ignore_logger
 
 from core.feature_flags.flags import FeatureFlags, FeatureToggle
+from core.file_upload import mime_types
+from core.file_upload.enums import FileToLLMMode, FileUploadMode
 
+from chat import prompts
 from chat.llm_configuration import cached_load_llm_configuration, load_llm_configuration
 from conversations.brave_settings import BraveSettings
+from conversations.staan_settings import StaanSettings
+from conversations.celery_settings import CelerySettings
+from conversations.observability_settings import ObservabilitySettings
+from conversations.oidc_settings import OIDCSettings
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,7 +56,14 @@ def get_release():
         return "NA"  # Default: not available
 
 
-class Base(BraveSettings, Configuration):
+class Base(
+    BraveSettings,
+    StaanSettings,
+    CelerySettings,
+    ObservabilitySettings,
+    OIDCSettings,
+    Configuration,
+):
     """
     This is the base configuration every configuration (aka environment) should inherit from. It
     is recommended to configure third-party applications by creating a configuration mixins in
@@ -125,7 +141,7 @@ class Base(BraveSettings, Configuration):
         },
         "staticfiles": {
             "BACKEND": values.Value(
-                "whitenoise.storage.CompressedManifestStaticFilesStorage",
+                "servestatic.storage.CompressedManifestStaticFilesStorage",
                 environ_name="STORAGES_STATICFILES_BACKEND",
             ),
         },
@@ -169,86 +185,39 @@ class Base(BraveSettings, Configuration):
         environ_name="ATTACHMENT_CHECK_UNSAFE_MIME_TYPES_ENABLED",
         environ_prefix=None,
     )
-    ATTACHMENT_UNSAFE_MIME_TYPES = [
-        # Executable Files
-        "application/x-msdownload",
-        "application/x-bat",
-        "application/x-dosexec",
-        "application/x-sh",
-        "application/x-ms-dos-executable",
-        "application/x-msi",
-        "application/java-archive",
-        "application/octet-stream",
-        # Dynamic Web Pages
-        "application/x-httpd-php",
-        "application/x-asp",
-        "application/x-aspx",
-        "application/jsp",
-        "application/xhtml+xml",
-        "application/x-python-code",
-        "application/x-perl",
-        "text/html",
-        "text/javascript",
-        "text/x-php",
-        # System Files
-        "application/x-msdownload",
-        "application/x-sys",
-        "application/x-drv",
-        "application/cpl",
-        "application/x-apple-diskimage",
-        # Script Files
-        "application/javascript",
-        "application/x-vbscript",
-        "application/x-powershell",
-        "application/x-shellscript",
-        # Compressed/Archive Files
-        "application/zip",
-        "application/x-tar",
-        "application/gzip",
-        "application/x-bzip2",
-        "application/x-7z-compressed",
-        "application/x-rar",
-        "application/x-rar-compressed",
-        "application/x-compress",
-        "application/x-lzma",
-        # Macros in Documents
-        "application/vnd.ms-word",
-        "application/vnd.ms-excel",
-        "application/vnd.ms-powerpoint",
-        "application/vnd.ms-word.document.macroenabled.12",
-        "application/vnd.ms-excel.sheet.macroenabled.12",
-        "application/vnd.ms-powerpoint.presentation.macroenabled.12",
-        # Disk Images & Virtual Disk Files
-        "application/x-iso9660-image",
-        "application/x-vmdk",
-        "application/x-apple-diskimage",
-        "application/x-dmg",
-        # Other Dangerous MIME Types
-        "application/x-ms-application",
-        "application/x-msdownload",
-        "application/x-shockwave-flash",
-        "application/x-silverlight-app",
-        "application/x-java-vm",
-        "application/x-bittorrent",
-        "application/hta",
-        "application/x-csh",
-        "application/x-ksh",
-        "application/x-ms-regedit",
-        "application/x-msdownload",
-        "application/xml",
-    ]
+    ATTACHMENT_UNSAFE_MIME_TYPES = mime_types.UNSAFE_MIME_TYPES
     ATTACHMENT_MAX_SIZE = values.IntegerValue(
         10 * (2**20),  # 10MB
         environ_name="ATTACHMENT_MAX_SIZE",
         environ_prefix=None,
     )
+    # Resource-exhaustion guards for the document parser (guards.py). The upload
+    # cap above bounds compressed bytes; these bound how much a ZIP-container
+    # document (DOCX/XLSX/PPTX/ODT) may expand and how many pages an in-process
+    # PDF parse may loop over, so a decompression bomb or a huge PDF can't OOM
+    # or pin a worker.
+    ATTACHMENT_PARSE_MAX_UNCOMPRESSED_SIZE = values.IntegerValue(
+        200 * (2**20),  # 200MB of declared uncompressed content
+        environ_name="ATTACHMENT_PARSE_MAX_UNCOMPRESSED_SIZE",
+        environ_prefix=None,
+    )
+    ATTACHMENT_PARSE_MAX_COMPRESSION_RATIO = values.PositiveIntegerValue(
+        default=100,  # uncompressed / compressed
+        environ_name="ATTACHMENT_PARSE_MAX_COMPRESSION_RATIO",
+        environ_prefix=None,
+    )
+    ATTACHMENT_PARSE_MAX_PDF_PAGES = values.PositiveIntegerValue(
+        default=2000,
+        environ_name="ATTACHMENT_PARSE_MAX_PDF_PAGES",
+        environ_prefix=None,
+    )
     FILE_UPLOAD_MODE = values.Value(
-        "presigned_url",
+        FileUploadMode.PRESIGNED_URL,
         environ_name="FILE_UPLOAD_MODE",
         environ_prefix=None,
     )
     FILE_TO_LLM_MODE = values.Value(
-        "presigned_url",
+        FileToLLMMode.PRESIGNED_URL,
         environ_name="FILE_TO_LLM_MODE",
         environ_prefix=None,
     )
@@ -337,7 +306,7 @@ class Base(BraveSettings, Configuration):
 
     MIDDLEWARE = [
         "django.middleware.security.SecurityMiddleware",
-        "whitenoise.middleware.WhiteNoiseMiddleware",
+        "servestatic.middleware.ServeStaticMiddleware",
         "core.middleware.MaintenanceMiddleware",
         "django.contrib.sessions.middleware.SessionMiddleware",
         "django.middleware.locale.LocaleMiddleware",
@@ -358,10 +327,12 @@ class Base(BraveSettings, Configuration):
 
     # Django applications from the highest priority to the lowest
     INSTALLED_APPS = [
+        # Historical activation-code records only; the gate itself was removed.
         "activation_codes",
         "chat",
         "core",
         "demo",
+        "servestatic",
         "drf_spectacular",
         # Third party apps
         "corsheaders",
@@ -424,6 +395,30 @@ class Base(BraveSettings, Configuration):
                 environ_name="API_FILE_STREAM_THROTTLE_RATE",
                 environ_prefix=None,
             ),
+            # Conversations and projects are created without any other ceiling,
+            # so each is bounded by an hourly and a daily rate at once: the
+            # hourly one stops a runaway client, the daily one bounds how much
+            # a single account can accumulate in storage.
+            "conversation_create_hourly": values.Value(
+                default="20/hour",
+                environ_name="API_CONVERSATION_CREATE_HOURLY_THROTTLE_RATE",
+                environ_prefix=None,
+            ),
+            "conversation_create_daily": values.Value(
+                default="100/day",
+                environ_name="API_CONVERSATION_CREATE_DAILY_THROTTLE_RATE",
+                environ_prefix=None,
+            ),
+            "project_create_hourly": values.Value(
+                default="10/hour",
+                environ_name="API_PROJECT_CREATE_HOURLY_THROTTLE_RATE",
+                environ_prefix=None,
+            ),
+            "project_create_daily": values.Value(
+                default="100/day",
+                environ_name="API_PROJECT_CREATE_DAILY_THROTTLE_RATE",
+                environ_prefix=None,
+            ),
         },
     }
 
@@ -470,9 +465,6 @@ class Base(BraveSettings, Configuration):
         environ_name="CORS_ALLOW_HEADERS",
     ) + list(default_headers)
 
-    # Sentry
-    SENTRY_DSN = values.Value(None, environ_name="SENTRY_DSN", environ_prefix=None)
-
     # Frontend
     FRONTEND_THEME = values.Value(None, environ_name="FRONTEND_THEME", environ_prefix=None)
     FRONTEND_HOMEPAGE_FEATURE_ENABLED = values.BooleanValue(
@@ -515,13 +507,6 @@ class Base(BraveSettings, Configuration):
         environ_prefix=None,
     )
 
-    # Posthog
-    # Looks like "{'id': 'posthog_key', 'host': 'https://product.conversations.127.0.0.1.nip.io'}"
-    POSTHOG_KEY = values.DictValue(None, environ_name="POSTHOG_KEY", environ_prefix=None)
-    POSTHOG_MW_CAPTURE_EXCEPTIONS = values.BooleanValue(
-        default=False, environ_name="POSTHOG_MW_CAPTURE_EXCEPTIONS", environ_prefix=None
-    )
-
     STATUS_PAGE_URL = values.Value(None, environ_name="STATUS_PAGE_URL", environ_prefix=None)
 
     # Easy thumbnails
@@ -541,127 +526,6 @@ class Base(BraveSettings, Configuration):
         default=60 * 60 * 12, environ_name="SESSION_COOKIE_AGE", environ_prefix=None
     )
 
-    # OIDC - Authorization Code Flow
-    OIDC_CREATE_USER = values.BooleanValue(
-        default=True,
-        environ_name="OIDC_CREATE_USER",
-    )
-    OIDC_RP_SIGN_ALGO = values.Value("RS256", environ_name="OIDC_RP_SIGN_ALGO", environ_prefix=None)
-    OIDC_RP_CLIENT_ID = values.Value(
-        "conversations", environ_name="OIDC_RP_CLIENT_ID", environ_prefix=None
-    )
-    OIDC_RP_CLIENT_SECRET = values.Value(
-        None,
-        environ_name="OIDC_RP_CLIENT_SECRET",
-        environ_prefix=None,
-    )
-    OIDC_OP_URL = values.Value(None, environ_name="OIDC_OP_URL", environ_prefix=None)
-    OIDC_OP_JWKS_ENDPOINT = values.Value(environ_name="OIDC_OP_JWKS_ENDPOINT", environ_prefix=None)
-    OIDC_OP_AUTHORIZATION_ENDPOINT = values.Value(
-        environ_name="OIDC_OP_AUTHORIZATION_ENDPOINT", environ_prefix=None
-    )
-    OIDC_OP_TOKEN_ENDPOINT = values.Value(
-        None, environ_name="OIDC_OP_TOKEN_ENDPOINT", environ_prefix=None
-    )
-    OIDC_OP_USER_ENDPOINT = values.Value(
-        None, environ_name="OIDC_OP_USER_ENDPOINT", environ_prefix=None
-    )
-    OIDC_OP_LOGOUT_ENDPOINT = values.Value(
-        None, environ_name="OIDC_OP_LOGOUT_ENDPOINT", environ_prefix=None
-    )
-    OIDC_AUTHENTICATE_CLASS = "lasuite.oidc_login.views.OIDCAuthenticationRequestView"
-    OIDC_CALLBACK_CLASS = "core.authentication.views.OIDCAuthenticationCallbackView"
-    OIDC_AUTH_REQUEST_EXTRA_PARAMS = values.DictValue(
-        {}, environ_name="OIDC_AUTH_REQUEST_EXTRA_PARAMS", environ_prefix=None
-    )
-    OIDC_RP_SCOPES = values.Value(
-        "openid email", environ_name="OIDC_RP_SCOPES", environ_prefix=None
-    )
-    # Restrict login and account creation to users exposing one of these roles
-    # in their OIDC "roles" claim. Empty (default) disables the restriction.
-    OIDC_ALLOWED_ROLES = values.ListValue(
-        [], environ_name="OIDC_ALLOWED_ROLES", environ_prefix=None
-    )
-    LOGIN_REDIRECT_URL = values.Value(None, environ_name="LOGIN_REDIRECT_URL", environ_prefix=None)
-    LOGIN_REDIRECT_URL_FAILURE = values.Value(
-        None, environ_name="LOGIN_REDIRECT_URL_FAILURE", environ_prefix=None
-    )
-    LOGOUT_REDIRECT_URL = values.Value(
-        None, environ_name="LOGOUT_REDIRECT_URL", environ_prefix=None
-    )
-    OIDC_USE_NONCE = values.BooleanValue(
-        default=True, environ_name="OIDC_USE_NONCE", environ_prefix=None
-    )
-    OIDC_REDIRECT_REQUIRE_HTTPS = values.BooleanValue(
-        default=False, environ_name="OIDC_REDIRECT_REQUIRE_HTTPS", environ_prefix=None
-    )
-    OIDC_REDIRECT_ALLOWED_HOSTS = values.ListValue(
-        default=[], environ_name="OIDC_REDIRECT_ALLOWED_HOSTS", environ_prefix=None
-    )
-    OIDC_STORE_ID_TOKEN = values.BooleanValue(
-        default=True, environ_name="OIDC_STORE_ID_TOKEN", environ_prefix=None
-    )
-    OIDC_FALLBACK_TO_EMAIL_FOR_IDENTIFICATION = values.BooleanValue(
-        default=True,
-        environ_name="OIDC_FALLBACK_TO_EMAIL_FOR_IDENTIFICATION",
-        environ_prefix=None,
-    )
-    OIDC_USE_PKCE = values.BooleanValue(
-        default=False, environ_name="OIDC_USE_PKCE", environ_prefix=None
-    )
-    OIDC_PKCE_CODE_CHALLENGE_METHOD = values.Value(
-        default="S256",
-        environ_name="OIDC_PKCE_CODE_CHALLENGE_METHOD",
-        environ_prefix=None,
-    )
-    OIDC_PKCE_CODE_VERIFIER_SIZE = values.IntegerValue(
-        default=64, environ_name="OIDC_PKCE_CODE_VERIFIER_SIZE", environ_prefix=None
-    )
-    OIDC_STORE_ACCESS_TOKEN = values.BooleanValue(
-        default=False, environ_name="OIDC_STORE_ACCESS_TOKEN", environ_prefix=None
-    )
-    OIDC_STORE_REFRESH_TOKEN = values.BooleanValue(
-        default=False, environ_name="OIDC_STORE_REFRESH_TOKEN", environ_prefix=None
-    )
-    OIDC_STORE_REFRESH_TOKEN_KEY = values.Value(
-        default=None,
-        environ_name="OIDC_STORE_REFRESH_TOKEN_KEY",
-        environ_prefix=None,
-    )
-
-    # WARNING: Enabling this setting allows multiple user accounts to share the same email
-    # address. This may cause security issues and is not recommended for production use when
-    # email is activated as fallback for identification (see previous setting).
-    OIDC_ALLOW_DUPLICATE_EMAILS = values.BooleanValue(
-        default=False,
-        environ_name="OIDC_ALLOW_DUPLICATE_EMAILS",
-        environ_prefix=None,
-    )
-
-    USER_OIDC_ESSENTIAL_CLAIMS = values.ListValue(
-        default=[], environ_name="USER_OIDC_ESSENTIAL_CLAIMS", environ_prefix=None
-    )
-
-    OIDC_USERINFO_FULLNAME_FIELDS = values.ListValue(
-        default=["first_name", "last_name"],
-        environ_name="OIDC_USERINFO_FULLNAME_FIELDS",
-        environ_prefix=None,
-    )
-    OIDC_USERINFO_SHORTNAME_FIELD = values.Value(
-        default="first_name",
-        environ_name="OIDC_USERINFO_SHORTNAME_FIELD",
-        environ_prefix=None,
-    )
-
-    ALLOW_LOGOUT_GET_METHOD = values.BooleanValue(
-        default=True, environ_name="ALLOW_LOGOUT_GET_METHOD", environ_prefix=None
-    )
-
-    # Activation feature
-    ACTIVATION_REQUIRED = values.BooleanValue(
-        default=False, environ_name="ACTIVATION_REQUIRED", environ_prefix=None
-    )
-
     BREVO_API_KEY = values.Value(
         default=None,
         environ_name="BREVO_API_KEY",
@@ -670,11 +534,6 @@ class Base(BraveSettings, Configuration):
     BREVO_FOLLOWUP_LIST_ID = values.Value(
         default=None,
         environ_name="BREVO_FOLLOWUP_LIST_ID",
-        environ_prefix=None,
-    )
-    BREVO_WAITING_LIST_ID = values.Value(
-        default=None,
-        environ_name="BREVO_WAITING_LIST_ID",
         environ_prefix=None,
     )
 
@@ -686,6 +545,11 @@ class Base(BraveSettings, Configuration):
     )
     LLM_DEFAULT_MODEL_HRID = values.Value(
         "default-model", environ_name="LLM_DEFAULT_MODEL_HRID", environ_prefix=None
+    )
+    LLM_EVAL_JUDGE_MODEL_HRID = values.Value(
+        "",
+        environ_name="LLM_EVAL_JUDGE_MODEL_HRID",
+        environ_prefix=None,
     )
     LLM_SUMMARIZATION_MODEL_HRID = values.Value(
         "default-summarization-model",
@@ -719,19 +583,43 @@ class Base(BraveSettings, Configuration):
         environ_name="DEFAULT_ALLOW_SMART_WEB_SEARCH",
         environ_prefix=None,
     )
+    # Conversation summary: at the start of a new user turn (before agent.iter), when the
+    # active slice of stored pydantic_messages (previous turns only) exceeds the message
+    # token budget (int(max_token_context * (1 - DOCUMENT_CONTEXT_BUDGET_RATIO)) - security_buffer).
+    # The incoming user message is intentionally NOT counted in this check: it is not
+    # persisted yet, so the check stays on stored history. A turn tipped over budget by the
+    # new message alone is caught on the next turn; the security buffer absorbs the overflow
+    # meanwhile (see ADR 0002). That history usually ends
+    # on an assistant ModelResponse. After a summary, keep roughly the last N ModelMessage
+    # entries before the checkpoint. Use an even N so the window starts on a user message.
+    # N is a target, not a strict ceiling: build_active_history first walks the window start
+    # back to the nearest user message so it never opens mid-tool-cycle, which can keep up to
+    # one complete turn more than N; it then drops whole turns off that retained tail until
+    # the window fits the budget, so a single oversized entry cannot keep the history over
+    # budget (which would re-trigger summarization every turn).
+    CONVERSATION_SUMMARY_CONTEXT_MESSAGES = values.PositiveIntegerValue(
+        default=10,
+        environ_name="CONVERSATION_SUMMARY_CONTEXT_MESSAGES",
+        environ_prefix=None,
+    )
+    CONVERSATION_SUMMARY_MAX_TOKENS = values.PositiveIntegerValue(
+        default=2048,
+        environ_name="CONVERSATION_SUMMARY_MAX_TOKENS",
+        environ_prefix=None,
+    )
 
     # These settings are default values used in the default LLM_CONFIGURATIONS
     # They allow a deployment with only one model without a specific configuration file
     AI_API_KEY = values.Value(None, environ_name="AI_API_KEY", environ_prefix=None)
     AI_BASE_URL = values.Value(None, environ_name="AI_BASE_URL", environ_prefix=None)
     AI_MODEL = values.Value(None, environ_name="AI_MODEL", environ_prefix=None)
+    # Dotted path of the web search tool for the default models, e.g.
+    # "chat.tools.web_search_staan.web_search_staan". Empty disables web search.
+    # (Empty string, not None: the LLM configuration resolves "settings.X"
+    # references and raises when the setting is None.)
+    AI_WEB_SEARCH = values.Value("", environ_name="AI_WEB_SEARCH", environ_prefix=None)
     AI_AGENT_INSTRUCTIONS = values.Value(
-        (
-            "You are a helpful assistant. "
-            "Wrap formulas or any math notation between `\\(...\\)` and `\\[...\\]`, "
-            "like `\\(x^2 + y^2 = z^2\\)` for inline formula or `\\[C_l\\]` for display. "
-            "You must use Markdown to format your answers except when asked otherwise. "
-        ),
+        prompts.DEFAULT_AGENT_INSTRUCTIONS,
         environ_name="AI_AGENT_INSTRUCTIONS",
         environ_prefix=None,
     )
@@ -745,37 +633,7 @@ class Base(BraveSettings, Configuration):
 
     # Uploaded files
     RAG_FILES_ACCEPTED_FORMATS = values.ListValue(
-        default=[
-            # docx files
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            # pptx files
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            # xlsx and xls files
-            "application/vnd.ms-excel",
-            "application/excel",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            # txt and csv files
-            "text/plain",
-            "text/csv",
-            "application/csv",
-            # pdf files
-            "application/pdf",
-            # html files
-            "text/html",
-            "application/xhtml+xml",
-            # markdown files
-            "text/markdown",
-            "application/markdown",
-            "application/x-markdown",
-            # outlook msg files
-            "application/vnd.ms-outlook",
-            # images
-            "image/jpeg",
-            "image/png",
-            "image/gif",
-            "image/webp",
-            "application/vnd.oasis.opendocument.text",
-        ],
+        default=mime_types.RAG_ACCEPTED_MIME_TYPES,
         environ_name="RAG_FILES_ACCEPTED_FORMATS",
         environ_prefix=None,
     )
@@ -836,65 +694,6 @@ class Base(BraveSettings, Configuration):
     SPECIFIC_RAG_DOCUMENT_SEARCH_TOOLS = values.DictValue(
         default={},
         environ_name="SPECIFIC_RAG_DOCUMENT_SEARCH_TOOLS",
-        environ_prefix=None,
-    )
-
-    # Web search
-    RAG_WEB_SEARCH_PROMPT_UPDATE = values.Value(
-        """
-You are a subject-matter expert assistant. 
-You are given :
- - web search result(s) or raw webpage text that may contain navigation, menus, comments, 
-   category names, and other unrelated page details.
- - document(s) that may contain text, images, and metadata, formatted in markdown.
-
-**Your mission:**
-- Use ONLY the main informational content that directly and factually answers the user's explicit 
-  question.
-- *Completely ignore and do NOT mention* any of the following in your answer:
-    - Web page or site structure
-    - Navigation elements, headers, menus, search bars, categories
-    - Lists of links, footers, or any site design features
-    - Any meta-observations about how the content is organized
-- NEVER include sections titled “Website Structure”, “Format”, “Layout”, or similar.
-- NEVER narrate, summarize, or analyze how the website is arranged or how links are presented.
-- If given a block of mixed web text, locate the relevant information AT THE SENTENCE LEVEL; 
-  include ONLY those sentences (possibly paraphrased) that respond to the user’s direct question.
-- If the relevant answer cannot be found in the content, simply state: “The provided content 
-  does not contain information directly answering the question.” Do not speculate or elaborate.
-
-#### Example output:
-
-> - John Doe criticized Jane the prime minister for "the absence of consultation" with other 
-    political forces regarding the 2025 the government budget, focusing on economic policy and 
-    spending plans.
-> - The country unemployment insurance system is noted as more generous than other neighbor's 
-    systems.
-> - [If more is needed, continue, but only with factual statements explicitly present in the 
-    provided content. Stop when unrelated content begins.]
-
-**Do NOT:**
-- Discuss the page’s design, link structure, main/secondary categories, branding, or site 
-  navigation tools.
-- Invent summaries for structure or offer general commentary about the website.
-
-{search_results}
-
-USER QUESTION:
-
-{user_prompt}
-        """,
-        environ_name="RAG_WEB_SEARCH_PROMPT_UPDATE",
-        environ_prefix=None,
-    )
-    RAG_WEB_SEARCH_MAX_RESULTS = values.PositiveIntegerValue(
-        default=5,
-        environ_name="RAG_WEB_SEARCH_MAX_RESULTS",
-        environ_prefix=None,
-    )
-    RAG_WEB_SEARCH_CHUNK_NUMBER = values.PositiveIntegerValue(
-        default=4,
-        environ_name="RAG_WEB_SEARCH_CHUNK_NUMBER",
         environ_prefix=None,
     )
 
@@ -967,6 +766,16 @@ USER QUESTION:
         environ_name="SUMMARIZATION_CONCURRENT_REQUESTS",
         environ_prefix=None,
     )
+    # One knob, two mechanisms - both share the finite context window:
+    #   `ratio`     -> full-document inlining budget. Higher inlines more docs
+    #                  verbatim; lower pushes them to tool_call_only (RAG). `0`
+    #                  disables inlining entirely.
+    #   `1 - ratio` -> conversation history budget that gates summarization.
+    #                  A smaller history share makes summarization trigger sooner.
+    # So raising this to inline more documents also shrinks the history budget and
+    # fires summarization earlier, and vice versa - they cannot be tuned
+    # independently. See docs/attachments.md and docs/history-processor.md.
+    #
     # Token estimation uses cl100k_base (GPT-4 tokenizer); non-OpenAI models
     # (Mistral, Llama, Anthropic) may tokenize 5-15% higher for the same text.
     # The security buffer below absorbs that drift.
@@ -987,23 +796,6 @@ USER QUESTION:
     DEFAULT_MAX_TOKEN_CONTEXT = values.PositiveIntegerValue(
         default=8192,
         environ_name="DEFAULT_MAX_TOKEN_CONTEXT",
-        environ_prefix=None,
-    )
-
-    # Tavily API
-    TAVILY_API_KEY = values.Value(
-        None,  # Tavily API key is not set by default
-        environ_name="TAVILY_API_KEY",
-        environ_prefix=None,
-    )
-    TAVILY_MAX_RESULTS = values.PositiveIntegerValue(
-        default=5,
-        environ_name="TAVILY_MAX_RESULTS",
-        environ_prefix=None,
-    )
-    TAVILY_API_TIMEOUT = values.PositiveIntegerValue(
-        default=10,  # seconds
-        environ_name="TAVILY_API_TIMEOUT",
         environ_prefix=None,
     )
 
@@ -1037,87 +829,31 @@ USER QUESTION:
         environ_prefix=None,
     )
 
-    # Find
-    FIND_API_KEY = values.Value(
-        None,
-        environ_name="FIND_API_KEY",
-        environ_prefix=None,
-    )
-    FIND_API_URL = values.Value(
-        "https://app-find/api",
-        environ_name="FIND_API_URL",
-        environ_prefix=None,
-    )
-    FIND_API_TIMEOUT = values.PositiveIntegerValue(
-        default=30,  # seconds
-        environ_name="FIND_API_TIMEOUT",
+    # Project-file RAG indexing (`index_project_attachment`) retries the store
+    # call on transient Albert failures (network/timeout, 5xx, 429) before
+    # marking the attachment FAILED. Total number of attempts, initial + retries
+    # (2 = one retry). Set to 1 to disable retrying.
+    RAG_STORE_MAX_ATTEMPTS = values.PositiveIntegerValue(
+        default=2,
+        environ_name="RAG_STORE_MAX_ATTEMPTS",
         environ_prefix=None,
     )
 
-    # Logging
-    # We want to make it easy to log to console but by default we log production
-    # to Sentry and don't want to log to console.
-    LOGGING = {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "simple": {
-                "format": "{asctime} {name} {levelname} {message}",
-                "style": "{",
-            },
-        },
-        "handlers": {
-            "console": {
-                "class": "logging.StreamHandler",
-                "formatter": "simple",
-            },
-        },
-        # Override root logger to send it to console
-        "root": {
-            "handlers": ["console"],
-            "level": values.Value(
-                "INFO", environ_name="LOGGING_LEVEL_LOGGERS_ROOT", environ_prefix=None
-            ),
-        },
-        "loggers": {
-            "core": {
-                "handlers": ["console"],
-                "level": values.Value(
-                    "INFO",
-                    environ_name="LOGGING_LEVEL_LOGGERS_APP",
-                    environ_prefix=None,
-                ),
-                "propagate": False,
-            },
-            "conversations.security": {
-                "handlers": ["console"],
-                "level": values.Value(
-                    "INFO",
-                    environ_name="LOGGING_LEVEL_LOGGERS_SECURITY",
-                    environ_prefix=None,
-                ),
-                "propagate": False,
-            },
-        },
-    }
+    # Delay, in seconds, the indexing worker sleeps between store attempts. Kept
+    # short: the worker blocks for this duration, so it trades a held slot for
+    # clearing brief Albert blips.
+    RAG_STORE_RETRY_DELAY_SECONDS = values.PositiveIntegerValue(
+        default=3,
+        environ_name="RAG_STORE_RETRY_DELAY_SECONDS",
+        environ_prefix=None,
+    )
 
-    # LLM Instrumentation
-    LANGFUSE_ENABLED = values.BooleanValue(
-        default=False, environ_name="LANGFUSE_ENABLED", environ_prefix=None
+    # Docs
+    DOCS_BASE_URL = values.Value(None, environ_name="DOCS_BASE_URL", environ_prefix=None)
+    DOCS_API_TIMEOUT = values.PositiveIntegerValue(
+        default=30, environ_name="DOCS_API_TIMEOUT", environ_prefix=None
     )
-    LANGFUSE_PUBLIC_KEY = values.Value(
-        None, environ_name="LANGFUSE_PUBLIC_KEY", environ_prefix=None
-    )
-    LANGFUSE_SECRET_KEY = values.Value(
-        None, environ_name="LANGFUSE_SECRET_KEY", environ_prefix=None
-    )
-    LANGFUSE_HOST = values.Value(None, environ_name="LANGFUSE_HOST", environ_prefix=None)
-    LANGFUSE_DEBUG = values.BooleanValue(
-        default=False, environ_name="LANGFUSE_DEBUG", environ_prefix=None
-    )
-    LANGFUSE_MEDIA_UPLOAD_ENABLED = values.BooleanValue(
-        default=False, environ_name="LANGFUSE_MEDIA_UPLOAD_ENABLED", environ_prefix=None
-    )
+
     AUTO_TITLE_AFTER_USER_MESSAGES = values.PositiveIntegerValue(
         default=None, environ_name="AUTO_TITLE_AFTER_USER_MESSAGES", environ_prefix=None
     )
@@ -1208,6 +944,32 @@ USER QUESTION:
         }
 
     @classmethod
+    def _validate_docs_configuration(cls):
+        """Validate the "Edit in Docs" settings.
+
+        DocsClient forwards the user's OIDC bearer token and document content to
+        DOCS_BASE_URL, so it requires stored access tokens and an encrypted endpoint.
+        """
+        if not cls.DOCS_BASE_URL:
+            return
+
+        if not cls.OIDC_STORE_ACCESS_TOKEN:
+            raise ValueError(
+                "DOCS_BASE_URL is set but OIDC_STORE_ACCESS_TOKEN is not enabled. "
+                "The Docs integration requires OIDC access tokens to be stored in the session."
+            )
+
+        # Reject plaintext endpoints — except localhost for local development.
+        docs_url = urlparse(cls.DOCS_BASE_URL)
+        is_local = docs_url.hostname in ("localhost", "127.0.0.1", "::1")
+        if docs_url.scheme != "https" and not is_local:
+            raise ValueError(
+                "DOCS_BASE_URL must use HTTPS to avoid leaking the forwarded OIDC "
+                "access token and document content over an unencrypted connection "
+                "(localhost is exempted for local development)."
+            )
+
+    @classmethod
     def post_setup(cls):
         """Post setup configuration.
         This is the place where you can configure settings that require other
@@ -1239,30 +1001,24 @@ USER QUESTION:
                 "OIDC_ALLOW_DUPLICATE_EMAILS cannot be set to True simultaneously. "
             )
 
+        if cls.OIDC_STORE_REFRESH_TOKEN:
+            try:
+                Fernet(cls.OIDC_STORE_REFRESH_TOKEN_KEY)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "OIDC_STORE_REFRESH_TOKEN is enabled but OIDC_STORE_REFRESH_TOKEN_KEY "
+                    "is not a valid Fernet key (32 url-safe base64-encoded bytes)."
+                ) from error
+
         # File access configuration validation
-        if cls.FILE_TO_LLM_MODE == "backend_temporary_url" and not cls.FILE_BACKEND_URL:
+        if cls.FILE_TO_LLM_MODE == FileToLLMMode.BACKEND_TEMPORARY_URL and not cls.FILE_BACKEND_URL:
             raise ValueError(
                 "FILE_TO_LLM_MODE is set to 'backend_temporary_url' but FILE_BACKEND_URL is empty. "
                 "Please set FILE_BACKEND_URL to a valid URL for backend temporary file access."
             )
 
-        # Find configuration
-        if (
-            cls.RAG_DOCUMENT_SEARCH_BACKEND
-            == "chat.agent_rag.document_rag_backends.find_rag_backend.FindRagBackend"
-            and not all(
-                (
-                    cls.FIND_API_KEY,
-                    cls.FIND_API_URL,
-                    cls.OIDC_STORE_ACCESS_TOKEN,
-                    cls.OIDC_STORE_REFRESH_TOKEN,
-                )
-            )
-        ):
-            raise ValueError(
-                f"{cls.RAG_DOCUMENT_SEARCH_BACKEND} requires FIND_API_KEY, FIND_API_URL, "
-                "OIDC_STORE_ACCESS_TOKEN and OIDC_STORE_REFRESH_TOKEN to be set."
-            )
+        # Docs configuration
+        cls._validate_docs_configuration()
 
         # Document context budget ratio must be a fraction (0 disables full inlining,
         # 1 dedicates the entire model context to documents).
@@ -1311,7 +1067,7 @@ class Build(Base):
         },
         "staticfiles": {
             "BACKEND": values.Value(
-                "whitenoise.storage.CompressedManifestStaticFilesStorage",
+                "servestatic.storage.CompressedManifestStaticFilesStorage",
                 environ_name="STORAGES_STATICFILES_BACKEND",
             ),
         },
@@ -1367,21 +1123,161 @@ class Test(Base):
     # Static files are not used in the test environment
     # Tests are raising warnings because the /data/static directory does not exist
     STATIC_ROOT = None
+    # Serve static via Django's finders instead of STATIC_ROOT (no collectstatic
+    # in tests); also silences ServeStatic's "STATIC_ROOT not configured" warning.
+    SERVESTATIC_USE_FINDERS = True
+
+    # Run celery tasks synchronously in tests, without a broker.
+    CELERY_TASK_ALWAYS_EAGER = True
 
     os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "true"
 
-    AI_BASE_URL = None
-    AI_API_KEY = None
-    AI_MODEL = None
+    # -------------------------------------------------------------------------
+    # Deterministic test settings.
+    #
+    # Tests get a dedicated, controlled environment: the ``app-test`` compose
+    # service (docker ``make test``) and pytest-dotenv (host / CI) load
+    # ``env.d/test`` instead of the developer-local ``env.d/development/common``.
+    # With that file gone, every setting Base derives from an environment
+    # variable falls back to Base's coded default, which is already
+    # deterministic. ``env.d/test`` only overrides the handful of settings whose
+    # Base default is unusable in tests (secrets, service credentials, provider
+    # endpoints/models); see that file.
+    #
+    # What stays pinned here is what is genuinely test-specific and NOT env
+    # -backed in Base:
+    #   - infra topology (Postgres, MinIO) describes the network, not behavior:
+    #     it defaults to the docker-compose hostnames but stays env-overridable
+    #     so pytest also runs on the host / in CI (repo-root .env or the CI job
+    #     env point at the published ports);
+    #   - test-only backends and structures (dummy malware backend, DRF/OpenAPI,
+    #     CORS headers, storages);
+    #   - the large AI/RAG prompts kept as short placeholders (the real ones are
+    #     only exercised by tests that override them explicitly).
+    #
+    # chat/tests/test_settings_isolation.py asserts the resulting settings are
+    # deterministic.
+    # -------------------------------------------------------------------------
 
-    # Pin to no role restriction so tests are deterministic regardless of the
-    # developer's local env (which may set OIDC_ALLOWED_ROLES); tests that need
-    # the restriction set it explicitly via override_settings.
-    OIDC_ALLOWED_ROLES = []
+    # -- Infra: docker-compose topology by default, env-overridable ------------
+    # Tests run from two vantage points: inside docker (DB_HOST=postgresql via
+    # the app-test service defaults) and on the host / CI (DB_HOST=localhost via
+    # the repo-root .env or the CI job env).
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql_psycopg2",
+            "NAME": "conversations",
+            "USER": "dinum",
+            "PASSWORD": "pass",
+            "HOST": os.environ.get("DB_HOST", "postgresql"),
+            "PORT": int(os.environ.get("DB_PORT", "5432")),
+        }
+    }
 
-    POSTHOG_KEY = None
+    STORAGES = {
+        "default": {"BACKEND": "storages.backends.s3.S3Storage"},
+        # Non-manifest variant: tests have no STATIC_ROOT / collectstatic step,
+        # and ServeStaticMiddleware reads the staticfiles storage eagerly.
+        "staticfiles": {"BACKEND": "servestatic.storage.CompressedStaticFilesStorage"},
+    }
 
-    AUTO_TITLE_AFTER_USER_MESSAGES = None
+    # AWS_S3_ENDPOINT_URL: docker default is the compose MinIO host; the repo
+    # -root .env / CI job env point it at the published port.
+    AWS_S3_ENDPOINT_URL = os.environ.get("AWS_S3_ENDPOINT_URL", "http://minio:9000")
+
+    # -- Attachments: dummy malware backend ------------------------------------
+    MALWARE_DETECTION = {
+        "BACKEND": "lasuite.malware_detection.backends.dummy.DummyBackend",
+        "PARAMETERS": {
+            "callback_path": ("core.file_upload.malware_detection.malware_detection_callback"),
+        },
+    }
+
+    # -- DRF / OpenAPI ---------------------------------------------------------
+    REST_FRAMEWORK = {
+        "DEFAULT_AUTHENTICATION_CLASSES": (
+            "mozilla_django_oidc.contrib.drf.OIDCAuthentication",
+            "rest_framework.authentication.SessionAuthentication",
+        ),
+        "DEFAULT_PARSER_CLASSES": [
+            "rest_framework.parsers.JSONParser",
+            "nested_multipart_parser.drf.DrfNestedParser",
+        ],
+        "DEFAULT_RENDERER_CLASSES": [
+            "rest_framework.renderers.JSONRenderer",
+        ],
+        "EXCEPTION_HANDLER": "core.api.exception_handler",
+        "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+        "PAGE_SIZE": 20,
+        "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.URLPathVersioning",
+        "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+        "DEFAULT_THROTTLE_RATES": {
+            "attachment_upload": "60/minute",
+            "attachment_auth": "60/minute",
+            "file-stream": "60/minute",
+            "conversation_create_hourly": "20/hour",
+            "conversation_create_daily": "100/day",
+            "project_create_hourly": "10/hour",
+            "project_create_daily": "100/day",
+        },
+    }
+
+    SPECTACULAR_SETTINGS = {
+        "TITLE": "Conversations API",
+        "DESCRIPTION": "This is the conversations API schema.",
+        "VERSION": "1.0.0",
+        "SERVE_INCLUDE_SCHEMA": False,
+        "ENABLE_DJANGO_DEPLOY_CHECK": False,
+        "COMPONENT_SPLIT_REQUEST": True,
+        "SWAGGER_UI_DIST": "SIDECAR",
+        "SWAGGER_UI_FAVICON_HREF": "SIDECAR",
+        "REDOC_DIST": "SIDECAR",
+    }
+
+    # -- CORS ------------------------------------------------------------------
+    CORS_ALLOW_HEADERS = [
+        "x-posthog-distinct-id",
+        "x-posthog-session-id",
+    ] + list(default_headers)
+
+    # -- AI / RAG prompt placeholders ------------------------------------------
+    # Kept as short placeholders instead of Base's large production prompts;
+    # tests that assert on prompt content override these explicitly.
+    AI_AGENT_INSTRUCTIONS = "You are a helpful assistant."
+
+    # -- Logging ---------------------------------------------------------------
+    LOGGING = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "simple": {
+                "format": "{asctime} {name} {levelname} {message}",
+                "style": "{",
+            },
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "simple",
+            },
+        },
+        "root": {
+            "handlers": ["console"],
+            "level": "INFO",
+        },
+        "loggers": {
+            "core": {
+                "handlers": ["console"],
+                "level": "INFO",
+                "propagate": False,
+            },
+            "conversations.security": {
+                "handlers": ["console"],
+                "level": "INFO",
+                "propagate": False,
+            },
+        },
+    }
 
     def __init__(self):
         # pylint: disable=invalid-name

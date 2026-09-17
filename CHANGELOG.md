@@ -6,6 +6,119 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- 🐛(ci) fix the CHANGELOG check failing when a pull request is opened
+- 🐛(back) replace whitenoise with servestatic for async-capable serving
+
+## [0.0.24] - 2026-09-08
+
+### Fixed
+
+- 🐛(front) fix translation hide source
+
+## [0.0.23] - 2026-09-07
+
+### Added
+
+- 💄(settings) move analytics settings to general
+- 📈(posthog) track projects, Docs export, summarization and co2 footprint
+- 👷(ci) audit GitHub Actions workflows with zizmor on push and pull request
+- 🔒️(back) throttle conversation and project creation per user
+- 🚸(front) explain the wait when a creation rate limit is reached
+
+### Changed
+
+- ⬆️(back) migrate to pydantic-ai 2.x
+- 🏗️(front) migrate the frontend from Next.js to Vite and React Router
+- 🏗️(front) rename frontend build var from the NEXT_PUBLIC_ prefix to VITE_
+- 💬(back) rewrite the default agent instructions and tool descriptions
+- 💄(front) correct icon Docs button
+- ♻️(back) use httpx as the single HTTP client for outbound calls
+- ⬆️(back) update django, pypdf, sqlparse and pydantic-settings
+- 🔒️(ci) pin CI actions and installed packages to immutable versions
+- ⚡️(ci) run e2e tests in parallel across browsers and shards
+- ✨(back) sort conversations by stored size in the admin list
+- 🚸(back) show 200 conversations per admin list page for bulk actions
+- ♻️(back) split the settings module into per-domain configuration mixins
+- ⬆️(chat) upgrade the Vercel AI SDK from v4 to v5
+
+### Fixed
+
+- 🐛(front) fix the frontend dev container failing to start
+- 🐛(back) read the OIDC_CREATE_USER setting from its documented env var
+ 
+### Removed
+
+- 🔥(back) remove the unused Albert web search manager and its tool
+- 🔥(back) remove the unused RAG_WEB_SEARCH_PROMPT_UPDATE setting
+- 🔥(back) remove the unused Tavily web search tool
+- 🔥(back) remove the activation code gate, keeping past records for history
+- 🔥(back) remove the unused text streaming protocol
+
+## [0.0.22] - 2026-08-10
+
+### Added
+
+- ✨(conversation) summarize messages
+
+### Changed
+
+- ⚡️(back) add users to the Brevo follow-up list only at signup
+- ✨(back) list conversation files on the admin conversation page
+- ⚡️(back) speed up the admin conversation list page
+- ♻️(back) parse PDFs through the current Albert OCR endpoint
+- ⬆️(dependencies) update dependencies and pin CVE-affected packages
+
+### Removed
+
+- 🔥(back) remove the unused Albert RAG document search module
+
+## [0.0.21] - 2026-07-28
+
+### Changed
+
+- ⬆️(dependencies) update pypdf and next
+
+### Fixed
+
+- 🐛(back) align Albert RAG document upload and search with the current API
+
+## [0.0.20] - 2026-07-23
+
+### Added
+
+- 💄(front) add tooltip co2
+- ✨(back) add slide deck generation tool
+- ✨(back) add model fallback mechanism
+- ✨(back) add celery for running background tasks
+- 🧱(helm) add celery worker and beat deployments
+- ✨(front) add "Edit in Docs" action to export a message to Docs
+- 🔒(back) guard parsing against decompression bombs and oversized PDFs
+
+### Changed
+
+- ♻️(back) split chat views and replace hardcoded strings with constants
+- 💄(front) change 404 illustration
+- ✨(back) process project files asynchronously with indexing state
+- ⚡️(back) process conversation files asynchronously off the request worker
+- ⬆️(dependencies) update dependencies and pin CVE-affected packages
+- ♻️(front) consolidate input chat banners into a reusable component
+- ⬆️(dependencies) drop unused pydantic-ai extras
+- 💬(back) use a generic localised timestamped title for Docs exports
+- ⬆️(front) pin sharp to a libvips patched against GHSA-f88m-g3jw-g9cj
+
+### Fixed
+
+- 🐛(front) prevent app crash for users without a full name or email
+- 🐛(front) refresh the conversation title in the collapsed left panel
+
+### Removed
+
+- 🔥(back) remove the Find RAG backend and its FIND_API_* settings
+
 ## [0.0.19] - 2026-06-24
 
 ### Changed
@@ -19,7 +132,7 @@ and this project adheres to
 
 - 🐛(front) keep the app open when using the contact link
 - 💄(front) use semantic warning color for banner icon
-- ✨(back) handle 404 during deletion as successful de-indexing 
+- ✨(back) handle 404 during deletion as successful de-indexing
 
 ## [0.0.18] - 2026-06-12
 
@@ -63,12 +176,14 @@ and this project adheres to
 - 🐛(backend) remove user list endpoint
 
 ### Added
+
 - ✨(frontend): display specific error when LLM provider is down
 
 ## [0.0.16] - 2026-05-21
 
 ### Added
 
+- ✨(sources) add source panel
 - ✨(onboarding) add onboarding modal
 - ✨(back) add ODT parsing support
 - ✨(back) add self-documentation tool
@@ -121,7 +236,7 @@ and this project adheres to
 
 - ⬆️(dependencies) upgrade Next.js 15 to 16, upgrade python dependencies
 - ✨(front) rich text copy for Word/Docs paste
- 
+
 ### Fixed
 
 - 🐛(back) add missing color option for project colors
@@ -361,24 +476,54 @@ and this project adheres to
 - ✨(langfuse) allow user to score messages from LLM #6
 - ✨(onboarding) add activation code logic for launch #62
 - 💄(chat) add code highlighting for LLM responses #67
+- 🔧(evals) add run_evals management command
 
-[unreleased]: https://github.com/suitenumerique/conversations/compare/v0.0.19...main
+[unreleased]: https://github.com/suitenumerique/conversations/compare/v0.0.24...main
+
+[0.0.24]: https://github.com/suitenumerique/conversations/compare/v0.0.23...v0.0.24
+
+[0.0.23]: https://github.com/suitenumerique/conversations/compare/v0.0.22...v0.0.23
+
+[0.0.22]: https://github.com/suitenumerique/conversations/compare/v0.0.22
+
+[0.0.21]: https://github.com/suitenumerique/conversations/compare/v0.0.21
+
+[0.0.20]: https://github.com/suitenumerique/conversations/compare/v0.0.20
+
 [0.0.19]: https://github.com/suitenumerique/conversations/releases/v0.0.19
+
 [0.0.18]: https://github.com/suitenumerique/conversations/releases/v0.0.18
+
 [0.0.17]: https://github.com/suitenumerique/conversations/releases/v0.0.17
+
 [0.0.16]: https://github.com/suitenumerique/conversations/releases/v0.0.16
+
 [0.0.15]: https://github.com/suitenumerique/conversations/releases/v0.0.15
+
 [0.0.14]: https://github.com/suitenumerique/conversations/releases/v0.0.14
+
 [0.0.13]: https://github.com/suitenumerique/conversations/releases/v0.0.13
+
 [0.0.12]: https://github.com/suitenumerique/conversations/releases/v0.0.12
+
 [0.0.11]: https://github.com/suitenumerique/conversations/releases/v0.0.11
+
 [0.0.10]: https://github.com/suitenumerique/conversations/releases/v0.0.10
+
 [0.0.9]: https://github.com/suitenumerique/conversations/releases/v0.0.9
+
 [0.0.8]: https://github.com/suitenumerique/conversations/releases/v0.0.8
+
 [0.0.7]: https://github.com/suitenumerique/conversations/releases/v0.0.7
+
 [0.0.6]: https://github.com/suitenumerique/conversations/releases/v0.0.6
+
 [0.0.5]: https://github.com/suitenumerique/conversations/releases/v0.0.5
+
 [0.0.4]: https://github.com/suitenumerique/conversations/releases/v0.0.4
+
 [0.0.3]: https://github.com/suitenumerique/conversations/releases/v0.0.3
+
 [0.0.2]: https://github.com/suitenumerique/conversations/releases/v0.0.2
+
 [0.0.1]: https://github.com/suitenumerique/conversations/releases/v0.0.1

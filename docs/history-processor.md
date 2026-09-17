@@ -1,28 +1,47 @@
-# History Processor (Sliding Window)
+# History Processing (Conversation Summarization)
 
-When a conversation grows long enough to exceed the model's context window, the backend automatically trims the oldest turns before each agent call. The full history is always preserved in the database — only the slice sent to the model is reduced.
+When a conversation grows long enough to exceed its token budget, the backend summarizes the oldest turns instead of sending them verbatim to the model. The full history is always preserved in the database — only the slice sent to the model is reduced, with a running summary standing in for the summarized prefix.
 
 ## How it works
 
-Before each agent call, `apply_sliding_window` checks whether the estimated token count of the history exceeds the conversation budget. If it does, it removes the oldest complete turns one by one until the history fits, then passes the trimmed slice to the model.
+Summarization is a visible blocking phase at the start of the triggering turn. A single check runs at the start of every turn, over the stored history from previous turns (the just-received user message is intentionally not counted — see ADR 0002): when the active history exceeds the conversation budget, the turn enqueues a Celery task to generate the summary, waits on the open stream (emitting keep-alive, with an in-thread progress bar on the client), and only then sends the input to the agent. Generation is **Celery-only** — the web process never runs the summarization LLM — and is guarded by a time-bounded claim on the conversation; checkpoint writes only ever advance, so duplicate completions are no-ops. A turn is never answered with degraded context: if no summary lands while the turn is still over budget — the worker is down, or generation kept failing — the turn errors with `summarization_failed`, and the enqueued task keeps running to persist the summary for the retry (see ADR 0001).
 
-A **turn** is the unit of trimming: a user message plus all the model responses and tool call/return pairs that follow it, up to the next user message. Turns are never split — either the whole turn is kept or the whole turn is dropped.
+Two functions in `chat/agents/history_processors.py` split the work. The Celery task calls `generate_history_summary`, which runs a dedicated summarization agent (`LLM_SUMMARIZATION_MODEL_HRID`) to fold the un-summarized messages into the previous summary; the result is persisted on the conversation. The turn itself only trims — `build_active_history` selects the runtime window, never calling the LLM. Two fields carry the summary across turns:
 
-The last turn is always kept, even if it alone exceeds the budget. This guarantees the current user message is never lost.
+- `history_summary` — the running summary text, injected into the model's dynamic instructions.
+- `history_summary_checkpoint` — the message index up to which the summary is valid.
+
+The model then receives the summary plus roughly the last `CONVERSATION_SUMMARY_CONTEXT_MESSAGES` `ModelMessage` entries before the checkpoint, so recent detail is kept verbatim. Use an **even** value so the retained window starts on a user message.
+
+That count is a **target, not a strict ceiling** — the window can end up either side of it. `build_active_history` first walks the window start *back* to the nearest user message so it never opens mid-tool-cycle, which can retain up to one complete turn more than asked. It then drops whole turns off the front of the retained tail until the window fits the conversation budget, which can retain fewer. The trigger measures that same budgeted window.
+
+Why the trim is needed: a message count is a poor proxy for token weight, so one oversized entry (a large paste, a fat tool result) can hold the window above budget on its own. The window start is derived from the checkpoint, so advancing the checkpoint cannot evict it. Without the trim the over-budget condition survives summarization and re-triggers the blocking phase on every following turn.
+
+Only the tail *before* the checkpoint is negotiable. Everything from the checkpoint on has no summary covering it yet and is kept whatever it costs, so the turn that first receives an oversized message is still sent over budget; only later turns benefit.
 
 ```text
-Full history:   [turn 1] [turn 2] [turn 3] [turn 4]  ← exceeds budget
-After trim:                        [turn 3] [turn 4]  ← fits within budget
-Database:       [turn 1] [turn 2] [turn 3] [turn 4]  ← untouched
+Full history:   [msg 1 … msg 20] [msg 21 … msg 30]   ← exceeds budget
+Sent to model:  [summary of 1–20] [msg 21 … msg 30]  ← fits within budget
+Database:       [msg 1 … msg 30] + summary           ← history untouched
 ```
 
-When trimming occurs, the backend emits a `context_trimmed` SSE event and the frontend displays a notice (session-only — resets on page reload):
+Summarization is **incremental**: later turns only summarize messages added since the last checkpoint, folding them into the existing summary.
 
-> *Some older messages are no longer in the model's context.*
+While the summarization call runs, the backend emits a `summarize` tool-call event so the frontend can show a "Summarizing conversation..." notice; the matching tool-result event reports `done` (checkpoint advanced) or `error` (summary kept as-is, retried on a later turn).
+
+Independently of summarization, old tool returns are compacted on every turn (`clean_tool_history`): only the latest tool cycle keeps its full tool responses, older ones are replaced with a `<tool response compacted>` placeholder.
+
+## Failure behavior
+
+Every step degrades gracefully. If the summarization LLM call fails, the previous summary and checkpoint are kept and the turn fails with a `summarization_failed` error; the background task retries with exponential backoff.
+
+## Operational notes
+
+An over-budget turn blocks its own SSE request while the worker generates, re-reading the conversation from the DB every `HISTORY_SUMMARY_POLL_INTERVAL_SECONDS` (default 2s) until the summary lands or the claim goes stale — up to the claim TTL (`HISTORY_SUMMARY_CLAIM_TTL_SECONDS`, ~180s). Summarization throughput is therefore bounded by Celery worker headroom, not the web tier: if workers are backlogged past the enqueue grace window (`SUMMARIZATION_ENQUEUE_CLAIM_GRACE_SECONDS`), the turn stalls and then fails with `summarization_failed`. Size the worker pool so summarization jobs are picked up within that grace window under expected concurrent-conversation load; each waiting turn also adds one `arefresh_from_db` per poll tick, so the poll interval trades DB load against how quickly a landed summary is noticed.
 
 ## Configuration
 
-Trimming is enabled by setting `max_token_context` on a model in the LLM configuration file:
+Summarization is enabled by default: *omitting* `max_token_context` does **not** disable it — `resolve_conversation_budget` falls back to `DEFAULT_MAX_TOKEN_CONTEXT`, leaving a non-zero history budget. Only zeroing `message_token_budget` disables it (`max_token_context=0`, `DOCUMENT_CONTEXT_BUDGET_RATIO=1`, or a large enough `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS` — see [attachments.md](attachments.md#conversation-history-summarization)). The budget is configured by setting `max_token_context` on a model in the LLM configuration file:
 
 ```json
 {
@@ -32,54 +51,20 @@ Trimming is enabled by setting `max_token_context` on a model in the LLM configu
 }
 ```
 
-If `max_token_context` is absent or `null` on the model configuration, it falls back to the `DEFAULT_MAX_TOKEN_CONTEXT` setting (default 8192). Set `DEFAULT_MAX_TOKEN_CONTEXT=0` in settings to disable trimming for models without an explicit context limit.
-
-### Misconfiguration warning
-
-If the computed conversation budget is 0 (e.g. `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS` exceeds the available tokens, or `DOCUMENT_CONTEXT_BUDGET_RATIO` is 1.0), trimming is disabled and the backend logs a warning:
-
-```
-Sliding window disabled: conversation budget is 0
-(max_token_context=N, security_buffer=M, budget_ratio=R).
-```
-
-### Budget formula
-
-The conversation budget is derived from two Django settings:
-
-| Setting | Description | Default |
-|---|---|---|
-| `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS` | Tokens reserved as a safety margin per pool | `1000` |
-| `DOCUMENT_CONTEXT_BUDGET_RATIO` | Fraction of the usable window allocated to documents | `0.5` |
+The conversation budget is derived from the same settings that drive the document inlining budget:
 
 ```text
-conversation_budget = int(max_token_context × (1 - DOCUMENT_CONTEXT_BUDGET_RATIO)) - DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS
+message_token_budget = max(int(max_token_context × (1 - DOCUMENT_CONTEXT_BUDGET_RATIO)) - DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS, 0)
 ```
 
-The security buffer is subtracted from **both** the conversation pool and the document pool independently — each pool's token count is approximated, so each pool needs its own safety margin.
-
-For example, with `max_token_context=128000`, `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS=1000`, and `DOCUMENT_CONTEXT_BUDGET_RATIO=0.3`:
-
-```
-conversation_budget = int(128000 × 0.7) - 1000 = 88600 tokens
-```
+See [attachments.md](attachments.md#conversation-history-summarization) for the full budget formulas, the settings reference (`DOCUMENT_CONTEXT_BUDGET_RATIO`, `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS`, `CONVERSATION_SUMMARY_CONTEXT_MESSAGES`, `CONVERSATION_SUMMARY_MAX_TOKENS`, `LLM_SUMMARIZATION_MODEL_HRID`) and how to disable summarization without changing document budgets.
 
 ## Token estimation
 
 Tokens are estimated without calling the model's tokenizer, using tiktoken (`cl100k_base`). This is intentionally rough — the goal is to stay well within the context limit, not to maximise usage. Each message also carries a small fixed overhead (4 tokens per part + 4 per message) to account for role markers and formatting.
 
-**Images** are counted using a flat constant of 1 500 tokens per image part (`ImageUrl` or `BinaryContent` with an `image/*` MIME type). Precise estimation is model-specific (OpenAI uses tile math, Anthropic uses a different formula), so a conservative constant keeps the estimator model-agnostic.
-
-**System prompt** tokens are subtracted from the conversation budget at calculation time using the static `configuration.system_prompt` string. Dynamic content injected at runtime (e.g. inlined document context) is not counted here — the security buffer absorbs that drift.
-
-**Agent instructions** (tool schemas, pydantic-ai framework overhead) are not counted. The security buffer is the backstop.
+**System prompt, tool schemas and pydantic-ai framework overhead** are not counted; the security buffer is the backstop.
 
 ## Local testing
 
-To trigger trimming locally, set a small `max_token_context` on the default model:
-
-```json
-"max_token_context": 500
-```
-
-After ~10 short messages the banner should appear and the chat should continue to work normally.
+To trigger summarization locally, set a small `max_token_context` on the default model (large enough to survive `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS`, or lower that setting too). After a few messages the "Summarizing conversation..." notice should appear and the chat should continue to work normally, with `history_summary` populated on the conversation row.

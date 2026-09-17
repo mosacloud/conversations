@@ -11,11 +11,10 @@ skip =
     *.tsbuildinfo,
     **/uv.lock,
     ./docker/files/etc/mime.types,
+    ./src/backend/chat/evals,
 check-filenames = true
 ignore-words-list =
     afterAll,
     projet,
     statics,
-exclude-file =
-    ./src/backend/chat/agent_rag/web_search/mocked.py,
 

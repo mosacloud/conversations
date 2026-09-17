@@ -1,45 +1,36 @@
 import { Button } from '@gouvfr-lasuite/cunningham-react';
-import Head from 'next/head';
-import Image from 'next/image';
-import { ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import styled from 'styled-components';
 
-import img403 from '@/assets/icons/icon-403.png';
+import Icon404 from '@/assets/icons/icon-404.svg?react';
 import { Box, Icon, StyledLink, Text } from '@/components';
 import { productName } from '@/core';
-import { PageLayout } from '@/layouts';
-import { NextPageWithLayout } from '@/types/next';
+import { useDocumentTitle } from '@/utils';
 
 const StyledButton = styled(Button)`
   width: fit-content;
 `;
 
-const Page: NextPageWithLayout = () => {
+const Page = () => {
   const { t } = useTranslation();
+
+  useDocumentTitle(`${t('Access Denied - Error 403')} - ${productName}`);
 
   return (
     <>
-      <Head>
-        <title>
-          {t('Access Denied - Error 403')} - {productName}
-        </title>
-        <meta
-          property="og:title"
-          content={`${t('Access Denied - Error 403')} - ${productName}`}
-          key="title"
-        />
-      </Head>
+      <meta
+        property="og:title"
+        content={`${t('Access Denied - Error 403')} - ${productName}`}
+      />
       <Box
         $align="center"
         $margin="auto"
         $gap="1rem"
         $padding={{ bottom: '2rem' }}
       >
-        <Image
+        <Icon404
           className="c__image-system-filter"
-          src={img403}
-          alt={t('Image 403')}
+          aria-hidden
           style={{
             maxWidth: '100%',
             height: 'auto',
@@ -60,10 +51,6 @@ const Page: NextPageWithLayout = () => {
       </Box>
     </>
   );
-};
-
-Page.getLayout = function getLayout(page: ReactElement) {
-  return <PageLayout withFooter={false}>{page}</PageLayout>;
 };
 
 export default Page;

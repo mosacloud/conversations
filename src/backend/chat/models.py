@@ -1,9 +1,11 @@
 """Models for chat conversations."""
 
+from datetime import timedelta
 from typing import Sequence
 
 from django.contrib.auth import get_user_model
 from django.db import models
+from django.utils import timezone
 
 from django_pydantic_field import SchemaField
 
@@ -11,7 +13,8 @@ from core.file_upload.enums import AttachmentStatus
 from core.models import BaseModel
 
 from chat.ai_sdk_types import UIMessage
-from chat.enums import CollectionIndexState
+from chat.constants import HISTORY_SUMMARY_CLAIM_TTL_SECONDS
+from chat.enums import AttachmentIndexState, CollectionIndexState
 
 User = get_user_model()
 
@@ -137,6 +140,15 @@ class ChatConversation(BaseModel):
         blank=True,
         help_text="Pydantic messages for the chat conversation, used for history",
     )
+    history_summary = models.TextField(
+        blank=True,
+        default="",
+        help_text="Latest generated conversation summary used as system context",
+    )
+    history_summary_checkpoint = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of pydantic history messages already compacted into history_summary",
+    )
     messages: Sequence[UIMessage] = SchemaField(
         schema=list[UIMessage],
         default=list,
@@ -171,14 +183,96 @@ class ChatConversation(BaseModel):
         blank=True,
     )
 
+    model_hrid = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text=(
+            "HRID of the LLM pinned to this conversation. Set on the first message and"
+            " kept for the whole conversation so a recovered main model does not move"
+            " ongoing chats. Empty string means 'not yet pinned'."
+        ),
+    )
+
+    history_summary_claimed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When a worker claimed summary generation; claims expire after "
+        "HISTORY_SUMMARY_CLAIM_TTL_SECONDS (dead-worker liveness bound)",
+    )
+
     class Meta:  # pylint: disable=missing-class-docstring
         indexes = [
             models.Index(fields=["owner", "-created_at"]),
             models.Index(fields=["owner", "project"]),
+            # Global "most recently updated first" listing, used by the admin changelist.
+            models.Index(fields=["-updated_at", "-id"]),
         ]
 
     def __str__(self):
         return self.title or str(self.pk)
+
+    def claim_history_summarization(self) -> bool:
+        """Atomically claim summary generation; True when we now hold the claim.
+
+        Succeeds when unclaimed or when the previous claim exceeded the TTL
+        (its worker is provably dead).
+        """
+        now = timezone.now()
+        expiry = now - timedelta(seconds=HISTORY_SUMMARY_CLAIM_TTL_SECONDS)
+        updated = (
+            type(self)
+            .objects.filter(pk=self.pk)
+            .filter(
+                models.Q(history_summary_claimed_at__isnull=True)
+                | models.Q(history_summary_claimed_at__lt=expiry)
+            )
+            .update(history_summary_claimed_at=now)
+        )
+        if updated:
+            self.history_summary_claimed_at = now
+        return bool(updated)
+
+    def release_history_summarization_claim(self) -> None:
+        """Release the claim, but only while we still hold it.
+
+        Guards against a stale worker wiping a newer worker's live claim: if
+        our claim already expired and another worker reclaimed, the timestamp
+        no longer matches ours and the update is a no-op. Mirrors the guarded
+        checkpoint write in `persist_history_summary`.
+        """
+        type(self).objects.filter(
+            pk=self.pk, history_summary_claimed_at=self.history_summary_claimed_at
+        ).update(history_summary_claimed_at=None)
+        self.history_summary_claimed_at = None
+
+    @property
+    def history_summarization_claim_is_live(self) -> bool:
+        """True while a claim exists and its worker may still be alive."""
+        claimed_at = self.history_summary_claimed_at
+        if claimed_at is None:
+            return False
+        return claimed_at > timezone.now() - timedelta(seconds=HISTORY_SUMMARY_CLAIM_TTL_SECONDS)
+
+    def persist_history_summary(self, summary: str, checkpoint: int) -> bool:
+        """Persist a generated summary only if it advances the checkpoint.
+
+        Messages are append-only, so a larger checkpoint is always the newer
+        result; late or duplicate completions are rejected.
+        """
+        updated = (
+            type(self)
+            .objects.filter(pk=self.pk, history_summary_checkpoint__lt=checkpoint)
+            .update(
+                history_summary=summary,
+                history_summary_checkpoint=checkpoint,
+                updated_at=timezone.now(),
+            )
+        )
+        if updated:
+            self.history_summary = summary
+            self.history_summary_checkpoint = checkpoint
+        return bool(updated)
 
 
 class ChatConversationAttachment(BaseModel):
@@ -249,9 +343,29 @@ class ChatConversationAttachment(BaseModel):
         ),
     )
 
+    # `is_indexed` and `index_state` overlap: `is_indexed=True` is exactly
+    # `index_state == INDEXED`. They coexist for historical reasons and split by
+    # owner. Conversation attachments use the older boolean `is_indexed` (it
+    # cannot express INDEXING/FAILED, which the conversation flow does not need).
+    # Project attachments use `index_state`, whose intermediate/failure states
+    # drive the upload UI. The project flow keeps both in sync so the 0009
+    # backfill invariant (rag_document_id present => is_indexed=True) holds.
+    # End state: migrate conversation callers onto `index_state` and drop this.
     is_indexed = models.BooleanField(
         default=False,
         help_text="Whether this attachment has been indexed in the RAG backend",
+    )
+
+    index_state = models.CharField(
+        max_length=20,
+        choices=AttachmentIndexState.choices(),
+        default=AttachmentIndexState.NOT_INDEXED,
+        help_text="Per-attachment RAG indexing lifecycle (set by the project indexing task)",
+    )
+    processing_error = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Human-readable reason the last indexing attempt failed, if any",
     )
 
     class Meta:  # pylint: disable=missing-class-docstring

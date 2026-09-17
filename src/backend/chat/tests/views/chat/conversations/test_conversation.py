@@ -19,10 +19,9 @@ from core.factories import UserFactory
 
 from chat.agents.conversation import PREVENT_URL_HALLUCINATION_INSTRUCTION
 from chat.ai_sdk_types import (
-    Attachment,
+    FileUIPart,
     TextUIPart,
-    ToolInvocationCall,
-    ToolInvocationUIPart,
+    ToolUIPart,
     UIMessage,
 )
 from chat.factories import ChatConversationFactory
@@ -31,6 +30,7 @@ from chat.tests.utils import (
     ZERO_USAGE,
     assert_data_stream_response,
     replace_uuids_with_placeholder,
+    throttle_rates,
 )
 from chat.tools.descriptions import SELF_DOCUMENTATION_SYSTEM_PROMPT
 
@@ -66,11 +66,7 @@ def _assert_hello_messages(chat_conversation, frozen_now):
         id=chat_conversation.messages[0].id,
         createdAt=frozen_now,
         content="Hello",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Hello")],
     )
     assert chat_conversation.messages[1].id == IsUUID(4)
@@ -78,11 +74,7 @@ def _assert_hello_messages(chat_conversation, frozen_now):
         id=chat_conversation.messages[1].id,
         createdAt=frozen_now,
         content="Hello there",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Hello there")],
     )
 
@@ -97,6 +89,7 @@ def _make_pydantic_request(  # pylint: disable=too-many-arguments,too-many-posit
         "metadata": None,
         "parts": [{"content": content, "part_kind": "user-prompt", "timestamp": timestamp}],
         "run_id": run_id,
+        "state": "complete",
         "timestamp": timestamp,
     }
 
@@ -159,20 +152,20 @@ def _decode_stream(response):
 
 
 HELLO_STREAM_CONTENT = (
-    '0:"Hello"\n'
-    '0:" there"\n'
-    'f:{"messageId":"<mocked_uuid>"}\n'
-    'd:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0'
-    ',"co2Impact":0.0}}\n'
+    'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+    'data: {"type":"text-start","id":"0"}\n\n'
+    'data: {"type":"text-delta","id":"0","delta":"Hello"}\n\n'
+    'data: {"type":"text-delta","id":"0","delta":" there"}\n\n'
+    'data: {"type":"text-end","id":"0"}\n\n'
+    'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionTokens":0'
+    ',"co2Impact":0.0}}}\n\n'
+    "data: [DONE]\n\n"
 )
 
 
 @pytest.fixture(autouse=True)
 def ai_settings(settings):
     """Fixture to set AI service URLs for testing."""
-    settings.AI_BASE_URL = "https://www.external-ai-service.com/"
-    settings.AI_API_KEY = "test-api-key"
-    settings.AI_MODEL = "test-model"
     settings.AI_AGENT_INSTRUCTIONS = "You are a helpful test assistant :)"
 
     return settings
@@ -211,25 +204,13 @@ def test_post_conversation_no_messages(api_client):
     assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
-def test_post_conversation_invalid_protocol(api_client):
-    """Test posting with an invalid protocol returns a 400 error."""
-    chat_conversation = ChatConversationFactory()
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=invalid"
-    data = {"messages": [{"role": "user", "content": "Hello there"}]}
-    api_client.force_login(chat_conversation.owner)
-    response = api_client.post(url, data, format="json")
-
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert response.json() == {"protocol": ["Protocol must be either 'text' or 'data'."]}
-
-
 @freeze_time("2025-07-25T10:36:35.297675Z")
 @respx.mock
 def test_post_conversation_data_protocol(api_client, mock_openai_stream, hello_conversation_data):
     """Test posting messages to a conversation using the 'data' protocol."""
     chat_conversation = ChatConversationFactory(owner__language="en-us")
 
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
     api_client.force_login(chat_conversation.owner)
 
     response = api_client.post(url, hello_conversation_data, format="json")
@@ -258,13 +239,19 @@ def test_post_conversation_data_protocol(api_client, mock_openai_stream, hello_c
 @freeze_time("2025-07-25T10:36:35.297675Z")
 @respx.mock
 @patch("chat.keepalive.get_current_time")
-def test_post_conversation_data_protocol_triggers_keepalives(
+def test_post_conversation_data_protocol_drops_keepalive_after_the_terminator(
     mock_time, api_client, mock_openai_stream, hello_conversation_data
 ):
-    """Test streaming response contains keepalive messages"""
+    """A keepalive queued as the stream ends is dropped, not sent after `[DONE]`.
+
+    The mocked clock makes every keepalive check trip, so one is queued; the
+    stream itself never pauses, so the only place it could land is past the
+    terminator. A real mid-stream keepalive is covered by
+    ``test_post_conversation_async_triggers_keepalive``.
+    """
     chat_conversation = ChatConversationFactory(owner__language="en-us")
-    mock_time.side_effect = [float(i * 60) for i in range(10)]
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    mock_time.side_effect = [float(i * 60) for i in range(20)]
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
     api_client.force_login(chat_conversation.owner)
 
     response = api_client.post(url, hello_conversation_data, format="json")
@@ -274,12 +261,14 @@ def test_post_conversation_data_protocol_triggers_keepalives(
     response_content = _decode_stream(response)
 
     assert response_content == (
-        '0:"Hello"\n'
-        '0:" there"\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0'
-        ',"co2Impact":0.0}}\n'
-        '2:[{"status": "WAITING"}]\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"Hello"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":" there"}\n\n'
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionToken'
+        's":0,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     assert mock_openai_stream.called
@@ -297,42 +286,10 @@ def test_post_conversation_data_protocol_triggers_keepalives(
 
 @freeze_time("2025-07-25T10:36:35.297675Z")
 @respx.mock
-def test_post_conversation_text_protocol(api_client, mock_openai_stream, hello_conversation_data):
-    """Test posting messages to a conversation using the 'text' protocol."""
-    chat_conversation = ChatConversationFactory(owner__language="en-us")
-
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=text"
-    api_client.force_login(chat_conversation.owner)
-
-    response = api_client.post(url, hello_conversation_data, format="json")
-
-    assert response.status_code == status.HTTP_200_OK
-    assert response.get("Content-Type") == "text/event-stream"
-    assert response.streaming
-
-    response_content = b"".join(response.streaming_content).decode("utf-8")
-    assert response_content == "Hello there"
-
-    assert mock_openai_stream.called
-    _assert_english_system_prompts(json.loads(respx.calls.last.request.content))
-
-    chat_conversation.refresh_from_db()
-    _assert_hello_ui_messages(chat_conversation)
-    _assert_hello_messages(chat_conversation, timezone.now())
-
-    _run_id = chat_conversation.pydantic_messages[0]["run_id"]
-    assert chat_conversation.pydantic_messages == [
-        _make_pydantic_request(_run_id, ENGLISH_INSTRUCTIONS, ["Hello"]),
-        _make_pydantic_text_response(_run_id, "Hello there"),
-    ]
-
-
-@freeze_time("2025-07-25T10:36:35.297675Z")
-@respx.mock
 def test_post_conversation_with_image(api_client, mock_openai_stream_image):
     """Ensure an image URL is correctly forwarded to the AI service."""
     chat_conversation = ChatConversationFactory(owner__language="en-us")
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
 
     data = {
         "messages": [
@@ -365,11 +322,14 @@ def test_post_conversation_with_image(api_client, mock_openai_stream_image):
     response_content = _decode_stream(response)
 
     assert response_content == (
-        '0:"I see a cat"\n'
-        '0:" in the picture."\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0'
-        ',"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"I see a cat"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":" in the picture."}\n\n'
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionToken'
+        's":0,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # --- Verify the outgoing HTTP request body contains the image ---
@@ -428,22 +388,19 @@ def test_post_conversation_with_image(api_client, mock_openai_stream_image):
         id=chat_conversation.messages[0].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="Hello, what do you see on this picture?",
-        reasoning=None,
-        experimental_attachments=[
-            Attachment(
-                name=None,
-                contentType="image/png",
+        role="user",
+        parts=[
+            TextUIPart(type="text", text="Hello, what do you see on this picture?"),
+            FileUIPart(
+                type="file",
+                mediaType="image/png",
                 url=(
                     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAIAQMAAAD+w"
                     "SzIAAAABlBMVEX///+/v7+jQ3Y5AAAADklEQVQI12P4AIX8EAgALgAD/aNpbtEA"
                     "AAAASUVORK5CYII="
                 ),
-            )
+            ),
         ],
-        role="user",
-        annotations=None,
-        toolInvocations=None,
-        parts=[TextUIPart(type="text", text="Hello, what do you see on this picture?")],
     )
 
     assert chat_conversation.messages[1].id == IsUUID(4)
@@ -451,11 +408,7 @@ def test_post_conversation_with_image(api_client, mock_openai_stream_image):
         id=chat_conversation.messages[1].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="I see a cat in the picture.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="I see a cat in the picture.")],
     )
 
@@ -489,7 +442,7 @@ def test_post_conversation_tool_call(api_client, mock_openai_stream_tool, settin
     settings.AI_AGENT_TOOLS = ["get_current_weather"]
 
     chat_conversation = ChatConversationFactory(owner__language="en-us")
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
 
     data = {
         "messages": [
@@ -511,16 +464,20 @@ def test_post_conversation_tool_call(api_client, mock_openai_stream_tool, settin
     response_content = _decode_stream(response)
 
     assert response_content == (
-        'b:{"toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","toolName":'
-        '"get_current_weather"}\n'
-        'c:{"toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","argsTextDelta":'
-        '"{\\"location\\":\\"Paris\\", \\"unit\\":\\"celsius\\"}"}\n'
-        'a:{"toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","result":{"location":'
-        '"Paris","temperature":22,"unit":"celsius"}}\n'
-        '0:"The current weather in Paris is nice"\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0'
-        ',"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-start","toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","to'
+        'olName":"get_current_weather"}\n\n'
+        'data: {"type":"tool-input-delta","toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","in'
+        'putTextDelta":"{\\"location\\":\\"Paris\\", \\"unit\\":\\"celsius\\"}"}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47'
+        '","output":{"location":"Paris","temperature":22,"unit":"celsius"}}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"The current weather in Paris is nice"}'
+        "\n\n"
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionToken'
+        's":0,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # --- Verify the outgoing HTTP request body ---
@@ -549,11 +506,7 @@ def test_post_conversation_tool_call(api_client, mock_openai_stream_tool, settin
         id=chat_conversation.messages[0].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="Weather in Paris?",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Weather in Paris?")],
     )
 
@@ -562,21 +515,13 @@ def test_post_conversation_tool_call(api_client, mock_openai_stream_tool, settin
         id=chat_conversation.messages[1].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="The current weather in Paris is nice",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
-            ToolInvocationUIPart(
-                type="tool-invocation",
-                toolInvocation=ToolInvocationCall(
-                    toolCallId="xLDcIljdsDrz0idal7tATWSMm2jhMj47",
-                    toolName="get_current_weather",
-                    args={"unit": "celsius", "location": "Paris"},
-                    state="call",
-                    step=None,
-                ),
+            ToolUIPart(
+                type="tool-get_current_weather",
+                toolCallId="xLDcIljdsDrz0idal7tATWSMm2jhMj47",
+                state="input-available",
+                input={"unit": "celsius", "location": "Paris"},
             ),
             TextUIPart(type="text", text="The current weather in Paris is nice"),
         ],
@@ -633,6 +578,7 @@ def test_post_conversation_tool_call(api_client, mock_openai_stream_tool, settin
                 }
             ],
             "run_id": _run_id,
+            "state": "complete",
             "timestamp": FROZEN_TIMESTAMP,
         },
         _make_pydantic_text_response(
@@ -645,12 +591,11 @@ def test_post_conversation_tool_call(api_client, mock_openai_stream_tool, settin
 
 @freeze_time("2025-07-25T10:36:35.297675Z")
 @respx.mock
-def test_post_conversation_tool_call_fails(api_client, mock_openai_stream_tool, settings):
+def test_post_conversation_tool_call_fails(api_client, mock_openai_stream_tool):
     """Ensure tool calls are correctly forwarded and streamed back when failing."""
-    settings.AI_AGENT_TOOLS = []
 
     chat_conversation = ChatConversationFactory(owner__language="fr-fr")
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
 
     data = {
         "messages": [
@@ -672,15 +617,22 @@ def test_post_conversation_tool_call_fails(api_client, mock_openai_stream_tool, 
     response_content = _decode_stream(response)
 
     assert response_content == (
-        'b:{"toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","toolName":"get_current_weather"}\n'
-        'c:{"toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","argsTextDelta":'
-        '"{\\"location\\":\\"Paris\\", \\"unit\\":\\"celsius\\"}"}\n'
-        'a:{"toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","result":"Unknown tool '
-        "name: 'get_current_weather'. Available tools: 'self_documentation'\"}\n"
-        '0:"I cannot give you an answer to that."\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0'
-        ',"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-start","toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","to'
+        'olName":"get_current_weather"}\n\n'
+        'data: {"type":"tool-input-delta","toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47","in'
+        'putTextDelta":"{\\"location\\":\\"Paris\\", \\"unit\\":\\"celsius\\"}"}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"xLDcIljdsDrz0idal7tATWSMm2jhMj47'
+        '","output":"Unknown tool name: \'get_current_weather\'. '
+        "Available tools: 'generate_presentation', "
+        "'self_documentation'\"}\n\n"
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"I cannot give you an answer to that."}'
+        "\n\n"
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionToken'
+        's":0,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # --- Verify the outgoing HTTP request body ---
@@ -709,11 +661,7 @@ def test_post_conversation_tool_call_fails(api_client, mock_openai_stream_tool, 
         id=chat_conversation.messages[0].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="Weather in Paris?",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Weather in Paris?")],
     )
 
@@ -722,21 +670,13 @@ def test_post_conversation_tool_call_fails(api_client, mock_openai_stream_tool, 
         id=chat_conversation.messages[1].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="I cannot give you an answer to that.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
-            ToolInvocationUIPart(
-                type="tool-invocation",
-                toolInvocation=ToolInvocationCall(
-                    toolCallId="xLDcIljdsDrz0idal7tATWSMm2jhMj47",
-                    toolName="get_current_weather",
-                    args={"unit": "celsius", "location": "Paris"},
-                    state="call",
-                    step=None,
-                ),
+            ToolUIPart(
+                type="tool-get_current_weather",
+                toolCallId="xLDcIljdsDrz0idal7tATWSMm2jhMj47",
+                state="input-available",
+                input={"unit": "celsius", "location": "Paris"},
             ),
             TextUIPart(type="text", text="I cannot give you an answer to that."),
         ],
@@ -788,7 +728,7 @@ def test_post_conversation_tool_call_fails(api_client, mock_openai_stream_tool, 
             "parts": [
                 {
                     "content": "Unknown tool name: 'get_current_weather'. "
-                    "Available tools: 'self_documentation'",
+                    "Available tools: 'generate_presentation', 'self_documentation'",
                     "part_kind": "retry-prompt",
                     "timestamp": FROZEN_TIMESTAMP,
                     "tool_call_id": "xLDcIljdsDrz0idal7tATWSMm2jhMj47",
@@ -796,6 +736,7 @@ def test_post_conversation_tool_call_fails(api_client, mock_openai_stream_tool, 
                 }
             ],
             "run_id": _run_id,
+            "state": "complete",
             "timestamp": FROZEN_TIMESTAMP,
         },
         _make_pydantic_text_response(
@@ -810,7 +751,7 @@ def test_post_conversation_model_selection_invalid(api_client):
     """Test the user cannot select a different model if it does not exist."""
     chat_conversation = ChatConversationFactory()
 
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data&model_hrid=plop"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?model_hrid=plop"
     data = {
         "messages": [
             {
@@ -856,7 +797,7 @@ def test_post_conversation_model_selection_new(
 
     chat_conversation = ChatConversationFactory()
 
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data&model_hrid=plop"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?model_hrid=plop"
     api_client.force_login(chat_conversation.owner)
 
     response = api_client.post(url, hello_conversation_data, format="json")
@@ -904,7 +845,7 @@ def test_post_conversation_data_protocol_no_stream(
 
     chat_conversation = ChatConversationFactory(owner__language="en-us")
 
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
     data = {
         "messages": [
             {
@@ -926,33 +867,40 @@ def test_post_conversation_data_protocol_no_stream(
 
     if stream_delay:
         assert response_content == (
-            '0:"The "\n'
-            '0:"sky "\n'
-            '0:"appe"\n'
-            '0:"ars "\n'
-            '0:"blue"\n'
-            '0:" due"\n'
-            '0:" to "\n'
-            '0:"a ph"\n'
-            '0:"enom"\n'
-            '0:"enon"\n'
-            '0:" cal"\n'
-            '0:"led "\n'
-            '0:"Rayl"\n'
-            '0:"eigh"\n'
-            '0:" sca"\n'
-            '0:"tter"\n'
-            '0:"ing."\n'
-            'f:{"messageId":"<mocked_uuid>"}\n'
-            'd:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":135'
-            ',"co2Impact":0.0}}\n'
+            'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+            'data: {"type":"text-start","id":"0"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"The "}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"sky "}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"appe"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"ars "}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"blue"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":" due"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":" to "}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"a ph"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"enom"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"enon"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":" cal"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"led "}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"Rayl"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"eigh"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":" sca"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"tter"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"ing."}\n\n'
+            'data: {"type":"text-end","id":"0"}\n\n'
+            'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionT'
+            'okens":135,"co2Impact":0.0}}}\n\n'
+            "data: [DONE]\n\n"
         )
     else:
         assert response_content == (
-            '0:"The sky appears blue due to a phenomenon called Rayleigh scattering."\n'
-            'f:{"messageId":"<mocked_uuid>"}\n'
-            'd:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":135'
-            ',"co2Impact":0.0}}\n'
+            'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+            'data: {"type":"text-start","id":"0"}\n\n'
+            'data: {"type":"text-delta","id":"0","delta":"The sky appears blue due to a pheno'
+            'menon called Rayleigh scattering."}\n\n'
+            'data: {"type":"text-end","id":"0"}\n\n'
+            'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionT'
+            'okens":135,"co2Impact":0.0}}}\n\n'
+            "data: [DONE]\n\n"
         )
 
     assert mock_openai_no_stream.called
@@ -975,11 +923,7 @@ def test_post_conversation_data_protocol_no_stream(
         id=chat_conversation.messages[0].id,
         createdAt=timezone.now(),  # Mocked timestamp
         content="Why the sky is blue?",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Why the sky is blue?")],
     )
 
@@ -988,11 +932,7 @@ def test_post_conversation_data_protocol_no_stream(
         id=chat_conversation.messages[1].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="The sky appears blue due to a phenomenon called Rayleigh scattering.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
             TextUIPart(
                 type="text",
@@ -1039,7 +979,7 @@ async def test_post_conversation_async(api_client, mock_openai_stream, monkeypat
 
     chat_conversation = await sync_to_async(ChatConversationFactory)(owner__language="en-us")
 
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
     data = {
         "messages": [
             {
@@ -1084,11 +1024,7 @@ async def test_post_conversation_async(api_client, mock_openai_stream, monkeypat
         id=chat_conversation.messages[0].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="Hello",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Hello")],
     )
 
@@ -1097,11 +1033,7 @@ async def test_post_conversation_async(api_client, mock_openai_stream, monkeypat
         id=chat_conversation.messages[1].id,  # don't test the message ID here
         createdAt=timezone.now(),  # Mocked timestamp
         content="Hello there",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Hello there")],
     )
 
@@ -1125,7 +1057,7 @@ async def test_post_conversation_async_triggers_keepalive(
 
     chat_conversation = await sync_to_async(ChatConversationFactory)(owner__language="en-us")
 
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
     data = {
         "messages": [
             {
@@ -1157,12 +1089,15 @@ async def test_post_conversation_async_triggers_keepalive(
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '0:"Hello"\n'
-        '2:[{"status": "WAITING"}]\n'
-        '0:" there"\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0'
-        ',"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"Hello"}\n\n'
+        'data: {"type":"data-keepalive","data":{"status":"WAITING"},"transient":true}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":" there"}\n\n'
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":0,"completionToken'
+        's":0,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     assert mock_openai_stream_slow.called
@@ -1177,11 +1112,7 @@ async def test_post_conversation_async_triggers_keepalive(
         id=chat_conversation.messages[0].id,  # don't test the message ID here
         createdAt=chat_conversation.messages[0].createdAt,  # Mocked timestamp
         content="Hello",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Hello")],
     )
 
@@ -1190,11 +1121,7 @@ async def test_post_conversation_async_triggers_keepalive(
         id=chat_conversation.messages[1].id,  # don't test the message ID here
         createdAt=chat_conversation.messages[1].createdAt,  # Mocked timestamp
         content="Hello there",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Hello there")],
     )
 
@@ -1213,7 +1140,7 @@ def test_post_conversation_oidc_refresh_enabled_unrefreshed(  # pylint: disable=
     """Test posting messages to a conversation without fresh access token should be forbidden."""
     chat_conversation = ChatConversationFactory(owner__language="en-us")
 
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
     data = {
         "messages": [
             {
@@ -1242,7 +1169,7 @@ def test_post_conversation_oidc_refresh_enabled(  # pylint: disable=unused-argum
     """Test posting messages to a conversation using the 'data' protocol."""
     chat_conversation = ChatConversationFactory(owner__language="en-us")
 
-    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data"
+    url = f"/api/v1.0/chats/{chat_conversation.pk}/conversation/"
     api_client.force_login(
         chat_conversation.owner, backend="core.authentication.backends.OIDCAuthenticationBackend"
     )
@@ -1269,3 +1196,40 @@ def test_post_conversation_oidc_refresh_enabled(  # pylint: disable=unused-argum
 
     assert len(chat_conversation.messages) == 2
     assert len(chat_conversation.pydantic_messages) == 2
+
+
+@freeze_time(FROZEN_TIMESTAMP)
+@respx.mock
+def test_post_conversation_is_not_affected_by_the_creation_throttle(
+    api_client, mock_openai_stream, hello_conversation_data
+):
+    """Appending a turn updates an existing conversation, so it is not throttled.
+
+    Both are POSTs on the same viewset, which is why the throttles are keyed on
+    the action rather than the HTTP method.
+    """
+    user = UserFactory(language="en-us")
+    api_client.force_login(user)
+    chat_conversation = ChatConversationFactory(owner=user)
+
+    with throttle_rates(conversation_create_hourly="1/hour"):
+        assert (
+            api_client.post("/api/v1.0/chats/", {"title": "first"}, format="json").status_code
+            == status.HTTP_201_CREATED
+        )
+        # The creation budget is now spent for this user...
+        assert (
+            api_client.post("/api/v1.0/chats/", {"title": "second"}, format="json").status_code
+            == status.HTTP_429_TOO_MANY_REQUESTS
+        )
+
+        # ...which must not stop them from continuing an existing conversation.
+        response = api_client.post(
+            f"/api/v1.0/chats/{chat_conversation.pk}/conversation/?protocol=data",
+            hello_conversation_data,
+            format="json",
+        )
+
+    assert_data_stream_response(response)
+    assert _decode_stream(response) == HELLO_STREAM_CONTENT
+    assert mock_openai_stream.called

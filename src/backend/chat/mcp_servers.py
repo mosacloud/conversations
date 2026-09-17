@@ -32,16 +32,17 @@ import re
 
 from django.conf import settings
 
-from pydantic_ai.mcp import MCPServerSSE, MCPServerStreamableHTTP
+from fastmcp.client.transports import SSETransport, StreamableHttpTransport
+from pydantic_ai.mcp import MCPToolset
 
 logger = logging.getLogger(__name__)
 
 _ENV_PLACEHOLDER = re.compile(r"\$\{(\w+)\}")
 
 _TRANSPORTS = {
-    "streamable-http": MCPServerStreamableHTTP,
-    "http": MCPServerStreamableHTTP,
-    "sse": MCPServerSSE,
+    "streamable-http": StreamableHttpTransport,
+    "http": StreamableHttpTransport,
+    "sse": SSETransport,
 }
 
 
@@ -80,17 +81,22 @@ def load_mcp_servers_configuration() -> dict:
 
 
 def get_mcp_servers():
-    """Build the list of pydantic-ai MCP server toolsets from configuration."""
+    """Build the list of pydantic-ai MCP toolsets from configuration.
+
+    The ``transport`` key selects the fastmcp transport explicitly (rather than
+    letting fastmcp infer it from the URL shape), so ``"sse"`` works for URLs
+    that don't end in ``/sse``.
+    """
     configuration = load_mcp_servers_configuration()
 
     servers = []
     for name, server_config in configuration.get("mcpServers", {}).items():
         config = dict(server_config)
-        transport = config.pop("transport", "streamable-http")
-        server_class = _TRANSPORTS.get(transport)
-        if server_class is None:
+        transport_name = config.pop("transport", "streamable-http")
+        transport_class = _TRANSPORTS.get(transport_name)
+        if transport_class is None:
             raise ValueError(
-                f"MCP server '{name}': unsupported transport '{transport}'. "
+                f"MCP server '{name}': unsupported transport '{transport_name}'. "
                 f"Expected one of {sorted(_TRANSPORTS)}."
             )
 
@@ -99,7 +105,14 @@ def get_mcp_servers():
             headers = {key: _resolve_env(val) for key, val in headers.items()}
 
         url = _resolve_env(config.pop("url"))
+        tool_prefix = config.pop("tool_prefix", None)
 
-        servers.append(server_class(url=url, headers=headers, **config))
+        toolset = MCPToolset(
+            transport_class(url=url, headers=headers), id=name, **config
+        )
+        if tool_prefix:
+            toolset = toolset.prefixed(tool_prefix)
+
+        servers.append(toolset)
 
     return servers

@@ -1,6 +1,6 @@
-import { Message } from '@ai-sdk/react';
+import { UIMessage } from 'ai';
 
-export type ChatMessage = Message;
+export type ChatMessage = UIMessage;
 
 export interface ChatConversationProject {
   id: string;
@@ -15,6 +15,10 @@ export interface ChatConversation {
   updated_at: string;
   title?: string;
   project?: ChatConversationProject | null;
+  // True when the pinned model can't read images and the conversation has any
+  // image (project or history). Backend-computed on read; drives the soft
+  // "image processing unavailable" banner.
+  images_skipped?: boolean;
 }
 export interface ChatProjectConversation {
   id: string;

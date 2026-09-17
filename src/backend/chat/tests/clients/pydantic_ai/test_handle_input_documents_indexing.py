@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock
 
 from django.utils import timezone
 
+import httpx
 import pytest
-import requests
 from asgiref.sync import sync_to_async
 from pydantic_ai.messages import BinaryContent
 
@@ -22,17 +22,6 @@ from chat.vercel_ai_sdk.core import events_v4
 PYDANTIC_AI_LOGGER = "chat.clients.pydantic_ai"
 
 pytestmark = pytest.mark.django_db(transaction=True)
-
-
-@pytest.fixture(autouse=True, name="base_settings")
-def base_settings_fixture(settings):
-    """Minimum LLM settings to instantiate AIAgentService."""
-    settings.AI_BASE_URL = "https://api.llm.com/v1/"
-    settings.AI_API_KEY = "test-key"
-    settings.AI_MODEL = "model-123"
-    settings.AI_AGENT_INSTRUCTIONS = "You are a helpful assistant"
-    settings.AI_AGENT_TOOLS = []
-    settings.REINDEX_CLAIM_TIMEOUT_SECONDS = 600
 
 
 _USER_MESSAGE = [
@@ -128,11 +117,11 @@ async def test_no_busy_error_when_indexing_claim_timed_out():
 # --------------------------------------------------------------------------- #
 
 
-def _http_error(status_code: int) -> requests.HTTPError:
-    """Build a requests.HTTPError whose response carries the given status code."""
-    response = requests.Response()
-    response.status_code = status_code
-    return requests.HTTPError(response=response)
+def _http_error(status_code: int) -> httpx.HTTPStatusError:
+    """Build an httpx.HTTPStatusError whose response carries the given status code."""
+    request = httpx.Request("POST", "https://albert.example.com/v1/documents")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
 
 
 async def _collect_handle_input_documents(service, exc):
@@ -177,11 +166,11 @@ async def test_handle_input_documents_emits_rag_unavailable_on_500(caplog):
 
 @pytest.mark.asyncio
 async def test_handle_input_documents_emits_rag_connection_error_on_network_failure():
-    """A requests.ConnectionError surfaces as kind=rag_connection_error."""
+    """An httpx.ConnectError surfaces as kind=rag_connection_error."""
     conversation = await sync_to_async(ChatConversationFactory)()
     service = AIAgentService(conversation, user=conversation.owner)
 
-    events = await _collect_handle_input_documents(service, requests.ConnectionError("no route"))
+    events = await _collect_handle_input_documents(service, httpx.ConnectError("no route"))
 
     result = _tool_result(events).result
     assert result["kind"] == "rag_connection_error"

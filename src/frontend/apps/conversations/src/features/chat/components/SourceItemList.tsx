@@ -1,4 +1,4 @@
-import { SourceUIPart } from '@ai-sdk/ui-utils';
+import { SourceUrlUIPart } from 'ai';
 import React from 'react';
 
 import { Box } from '@/components';
@@ -12,7 +12,7 @@ export interface SourceMetadata {
 }
 
 interface SourceItemListProps {
-  parts: readonly SourceUIPart[];
+  parts: readonly SourceUrlUIPart[];
   getMetadata: (url: string) => SourceMetadata | undefined;
 }
 
@@ -26,20 +26,16 @@ const SourceItemListComponent: React.FC<SourceItemListProps> = ({
   return (
     <Box
       $direction="column"
-      $padding={{ all: 'sm' }}
+      $padding={{ all: 'xs' }}
       $gap="4px"
-      $css={`
-       border: 1px solid var(--c--contextuals--border--surface--primary);
-       border-radius: 8px;
-       margin-top: 0.5rem;
-       overflow: hidden;
-     `}
+      $css="min-width: 0; width: 100%;"
     >
-      {parts.map((part) => (
+      {parts.map((part, index) => (
         <SourceItem
-          key={part.source.url}
-          url={part.source.url}
-          metadata={getMetadata(part.source.url)}
+          index={index + 1}
+          key={part.sourceId}
+          url={part.url}
+          metadata={getMetadata(part.url)}
         />
       ))}
     </Box>

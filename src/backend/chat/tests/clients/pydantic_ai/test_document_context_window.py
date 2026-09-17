@@ -37,7 +37,12 @@ def _parse_listing(instruction: str) -> dict:
 @pytest.fixture()
 def _llm_config_with_context(settings):
     """Configure a model with max_token_context for context window tests."""
+
     settings.DOCUMENT_CONTEXT_BUDGET_RATIO = 0.5
+    # Pin the buffer so the budget math stays deterministic regardless of the
+    # environment default: int(4000 * 0.5) - 1000 = 1000.
+    settings.DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS = 1000
+
     settings.LLM_CONFIGURATIONS = {
         "default-model": LLModel(
             hrid="default-model",
@@ -374,7 +379,6 @@ def test_document_context_uses_configurable_ratio(_llm_config_with_context, monk
 @pytest.fixture()
 def _llm_config_two_models(settings):
     """Two LLM configs so cache-key-by-model can be exercised."""
-    settings.DOCUMENT_CONTEXT_BUDGET_RATIO = 0.5
     settings.DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS = 0
     provider = LLMProvider(hrid="p", base_url="https://example.com", api_key="key")
     settings.LLM_CONFIGURATIONS = {

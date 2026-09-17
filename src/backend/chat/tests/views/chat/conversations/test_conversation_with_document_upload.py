@@ -1,7 +1,6 @@
 """Unit tests for chat conversation actions with document search RAG functionality."""
 
 # pylint: disable=too-many-lines
-import base64
 import dataclasses
 import json
 import logging
@@ -10,12 +9,11 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import ANY
 
-from django.contrib.sessions.backends.cache import SessionStore
+from django.core.files.storage import default_storage
 from django.utils import formats, timezone
 
 import httpx
 import pytest
-import responses
 import respx
 from dirty_equals import IsUUID
 from freezegun import freeze_time
@@ -28,16 +26,14 @@ from core.feature_flags.flags import FeatureToggle
 from chat.agents.conversation import PREVENT_URL_HALLUCINATION_INSTRUCTION
 from chat.agents.summarize import SummarizationAgent
 from chat.ai_sdk_types import (
-    Attachment,
-    LanguageModelV1Source,
-    SourceUIPart,
+    FileUIPart,
+    SourceUrlUIPart,
     TextUIPart,
-    ToolInvocationCall,
-    ToolInvocationUIPart,
+    ToolUIPart,
     UIMessage,
 )
 from chat.constants import ACCESS_TOOL_CALL_ONLY
-from chat.factories import ChatConversationFactory
+from chat.factories import ChatConversationAttachmentFactory, ChatConversationFactory
 from chat.tests.utils import replace_uuids_with_placeholder
 
 # enable database transactions for tests:
@@ -75,47 +71,16 @@ def _assert_document_instructions(
     assert doc["info"] == expected_info
 
 
-@pytest.fixture(
-    autouse=True,
-    params=[
-        "chat.agent_rag.document_rag_backends.find_rag_backend.FindRagBackend",
-        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend",
-    ],
-)
-def ai_settings(request, settings):
+@pytest.fixture(autouse=True)
+def ai_settings(settings):
     """Fixture to set AI service URLs for testing."""
-
     # enable on rag document search tool
-    settings.RAG_DOCUMENT_SEARCH_BACKEND = request.param
-    settings.RAG_WEB_SEARCH_PROMPT_UPDATE = (
-        "Based on the following document contents:\n\n{search_results}\n\n"
-        "Please answer the user's question: {user_prompt}"
+    settings.RAG_DOCUMENT_SEARCH_BACKEND = (
+        "chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend"
     )
-
-    settings.AI_BASE_URL = "https://www.external-ai-service.com/"
-    settings.AI_API_KEY = "test-api-key"
-    settings.AI_MODEL = "test-model"
     settings.AI_AGENT_INSTRUCTIONS = "You are a helpful test assistant :)"
 
-    # Albert API settings
-    settings.ALBERT_API_URL = "https://albert.api.etalab.gouv.fr"
-    settings.ALBERT_API_KEY = "albert-api-key"
-
-    # Find API settings
-    settings.FIND_API_URL = "https://find.api.example.com"
-    settings.FIND_API_KEY = "find-api-key"
-
     return settings
-
-
-@pytest.fixture(autouse=True)
-def mock_refresh_access_token():
-    """Mock refresh_access_token to bypass token refresh in tests."""
-    with mock.patch("utils.oidc.refresh_access_token") as mocked_refresh_access_token:
-        session = SessionStore()
-        session["oidc_access_token"] = "mocked-access-token"
-        mocked_refresh_access_token.return_value = session
-        yield mocked_refresh_access_token
 
 
 @pytest.fixture(name="sample_pdf_content")
@@ -155,39 +120,26 @@ def fixture_mock_document_api():
     search_method = "semantic"
     search_score = 0.9
 
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/collections",
-        json={"id": "123", "name": "test-collection"},
-        status=status.HTTP_200_OK,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/collections").mock(
+        return_value=httpx.Response(
+            status.HTTP_200_OK, json={"id": "123", "name": "test-collection"}
+        )
     )
 
     # Mock PDF parsing
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/parse-beta",
-        json={
-            "data": [
-                {
-                    "content": "This is the content of the PDF.",
-                    "metadata": {"document_name": "sample.pdf"},
-                }
-            ],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
-        },
-        status=status.HTTP_200_OK,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/ocr").mock(
+        return_value=httpx.Response(
+            status.HTTP_200_OK, json={"pages": [{"markdown": "This is the content of the PDF."}]}
+        )
     )
 
     # Mock document upload
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/documents",
-        json={"id": 456},
-        status=status.HTTP_201_CREATED,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/documents").mock(
+        return_value=httpx.Response(status.HTTP_201_CREATED, json={"id": 456})
     )
 
-    # Mock document search.
-    # Two clients use this endpoint:
-    # - AlbertRagBackend.asearch via httpx -> intercepted by respx
-    # - FindRagBackend (sync search via base-class fallback) via requests
-    #   -> intercepted by responses
+    # Mock document search. AlbertRagBackend.asearch calls this endpoint via
+    # httpx -> intercepted by respx.
     search_response_body = {
         "data": [
             {
@@ -202,35 +154,29 @@ def fixture_mock_document_api():
         ],
         "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
     }
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/search",
-        json=search_response_body,
-        status=status.HTTP_200_OK,
-    )
     respx.post("https://albert.api.etalab.gouv.fr/v1/search").mock(
         return_value=httpx.Response(status.HTTP_200_OK, json=search_response_body)
     )
 
     # Mock document indexing (Find API)
-    responses.post(
-        "https://find.api.example.com/api/v1.0/documents/index/",
-        json={"id": "456", "status": "indexed"},
-        status=status.HTTP_200_OK,
+    respx.post("https://app-find/api/v1.0/documents/index/").mock(
+        return_value=httpx.Response(status.HTTP_200_OK, json={"id": "456", "status": "indexed"})
     )
 
     # Mock document search (Find API)
-    responses.post(
-        "https://find.api.example.com/api/v1.0/documents/search/",
-        json=[
-            {
-                "_source": {
-                    "title.fr": document_name,
-                    "content.fr": document_content,
-                },
-                "_score": search_score,
-            }
-        ],
-        status=status.HTTP_200_OK,
+    respx.post("https://app-find/api/v1.0/documents/search/").mock(
+        return_value=httpx.Response(
+            status.HTTP_200_OK,
+            json=[
+                {
+                    "_source": {
+                        "title.fr": document_name,
+                        "content.fr": document_content,
+                    },
+                    "_score": search_score,
+                }
+            ],
+        )
     )
 
 
@@ -246,32 +192,22 @@ def fixture_mock_odt_document_api():
     search_method = "semantic"
     search_score = 0.9
 
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/collections",
-        json={"id": "123", "name": "test-collection"},
-        status=status.HTTP_200_OK,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/collections").mock(
+        return_value=httpx.Response(
+            status.HTTP_200_OK, json={"id": "123", "name": "test-collection"}
+        )
     )
 
     # Mock PDF parsing
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/parse-beta",
-        json={
-            "data": [
-                {
-                    "content": "This is the content of the ODT.",
-                    "metadata": {"document_name": "sample.odt"},
-                }
-            ],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
-        },
-        status=status.HTTP_200_OK,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/ocr").mock(
+        return_value=httpx.Response(
+            status.HTTP_200_OK, json={"pages": [{"markdown": "This is the content of the ODT."}]}
+        )
     )
 
     # Mock document upload
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/documents",
-        json={"id": 456},
-        status=status.HTTP_201_CREATED,
+    respx.post("https://albert.api.etalab.gouv.fr/v1/documents").mock(
+        return_value=httpx.Response(status.HTTP_201_CREATED, json={"id": 456})
     )
 
     # Mock document search (sync via responses, async via respx).
@@ -289,35 +225,29 @@ def fixture_mock_odt_document_api():
         ],
         "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
     }
-    responses.post(
-        "https://albert.api.etalab.gouv.fr/v1/search",
-        json=search_response_body,
-        status=status.HTTP_200_OK,
-    )
     respx.post("https://albert.api.etalab.gouv.fr/v1/search").mock(
         return_value=httpx.Response(status.HTTP_200_OK, json=search_response_body)
     )
 
     # Mock document indexing (Find API)
-    responses.post(
-        "https://find.api.example.com/api/v1.0/documents/index/",
-        json={"id": "456", "status": "indexed"},
-        status=status.HTTP_200_OK,
+    respx.post("https://app-find/api/v1.0/documents/index/").mock(
+        return_value=httpx.Response(status.HTTP_200_OK, json={"id": "456", "status": "indexed"})
     )
 
     # Mock document search (Find API)
-    responses.post(
-        "https://find.api.example.com/api/v1.0/documents/search/",
-        json=[
-            {
-                "_source": {
-                    "title.fr": document_name,
-                    "content.fr": document_content,
-                },
-                "_score": search_score,
-            }
-        ],
-        status=status.HTTP_200_OK,
+    respx.post("https://app-find/api/v1.0/documents/search/").mock(
+        return_value=httpx.Response(
+            status.HTTP_200_OK,
+            json=[
+                {
+                    "_source": {
+                        "title.fr": document_name,
+                        "content.fr": document_content,
+                    },
+                    "_score": search_score,
+                }
+            ],
+        )
     )
 
 
@@ -400,7 +330,7 @@ def fixture_mock_openai_stream():
     return route
 
 
-@responses.activate
+@respx.mock
 @respx.mock
 @freeze_time()
 def test_post_conversation_with_document_upload(
@@ -417,7 +347,17 @@ def test_post_conversation_with_document_upload(
     chat_conversation = ChatConversationFactory(owner__language="en-us")
     api_client.force_authenticate(user=chat_conversation.owner)
 
-    pdf_base64 = base64.b64encode(sample_pdf_content.read()).decode("utf-8")
+    file_path = f"{chat_conversation.pk}/sample.pdf"
+    ChatConversationAttachmentFactory(  # Must be created by frontend
+        conversation=chat_conversation,
+        uploaded_by=chat_conversation.owner,
+        key=file_path,
+        file_name="sample.pdf",
+        content_type="application/pdf",
+    )
+    default_storage.save(file_path, sample_pdf_content)
+    document_url = f"/media-key/{chat_conversation.pk}/sample.pdf"
+
     message = UIMessage(
         id="1",
         role="user",
@@ -427,13 +367,9 @@ def test_post_conversation_with_document_upload(
                 text="What does the document say?",
                 type="text",
             ),
-        ],
-        experimental_attachments=[
-            Attachment(
-                name="sample.pdf",
-                contentType="application/pdf",
-                url=f"data:application/pdf;base64,{pdf_base64}",
-            )
+            FileUIPart(
+                type="file", filename="sample.pdf", mediaType="application/pdf", url=document_url
+            ),
         ],
     )
 
@@ -458,7 +394,7 @@ def test_post_conversation_with_document_upload(
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -468,20 +404,25 @@ def test_post_conversation_with_document_upload(
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '9:{"toolCallId":"XXX","toolName":"document_parsing",'
-        '"args":{"documents":[{"identifier":"sample.pdf"}]}}\n'
-        'a:{"toolCallId":"XXX","result":{"state":"done"}}\n'
-        'b:{"toolCallId":"pyd_ai_YYY","toolName":"document_search_rag"}\n'
-        '9:{"toolCallId":"pyd_ai_YYY","toolName":"document_search_rag",'
-        '"args":{"query":"What does the document say?"}}\n'
-        'h:{"sourceType":"url","id":"<mocked_uuid>","url":"sample.pdf","title":null,'
-        '"providerMetadata":{}}\n'
-        'a:{"toolCallId":"pyd_ai_YYY","result":[{"url":"sample.pdf","content":"This '
-        'is the content of the PDF.","score":0.9}]}\n'
-        "0:\"From the document, I can see that it says 'Hello PDF'.\"\n"
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":100,"completionTokens":20,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"XXX","toolName":"document_parsing'
+        '","input":{"documents":[{"identifier":"sample.pdf"}]}}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"XXX","output":{"state":"done"}}'
+        "\n\n"
+        'data: {"type":"tool-input-start","toolCallId":"pyd_ai_YYY","toolName":"document_sear'
+        'ch_rag"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"pyd_ai_YYY","toolName":"document_'
+        'search_rag","input":{"query":"What does the document say?"}}\n\n'
+        'data: {"type":"source-url","sourceId":"<mocked_uuid>","url":"sample.pdf"}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"pyd_ai_YYY","output":[{"url":"sa'
+        'mple.pdf","content":"This is the content of the PDF.","score":0.9}]}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"From the document, I can see that it sa'
+        "ys 'Hello PDF'.\"}\n\n"
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":100,"completionTok'
+        'ens":20,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # Check that the conversation was updated
@@ -493,11 +434,7 @@ def test_post_conversation_with_document_upload(
         id=chat_conversation.messages[0].id,
         createdAt=timezone.now(),
         content="What does the document say?",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="What does the document say?")],
     )
 
@@ -506,32 +443,19 @@ def test_post_conversation_with_document_upload(
         id=chat_conversation.messages[1].id,
         createdAt=timezone.now(),
         content="From the document, I can see that it says 'Hello PDF'.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
-            ToolInvocationUIPart(
-                type="tool-invocation",
-                toolInvocation=ToolInvocationCall(
-                    toolCallId=chat_conversation.messages[1].parts[0].toolInvocation.toolCallId,
-                    toolName="document_search_rag",
-                    args={"query": "What does the document say?"},
-                    state="call",
-                    step=None,
-                ),
+            ToolUIPart(
+                type="tool-document_search_rag",
+                toolCallId=chat_conversation.messages[1].parts[0].toolCallId,
+                state="input-available",
+                input={"query": "What does the document say?"},
             ),
             TextUIPart(type="text", text="From the document, I can see that it says 'Hello PDF'."),
-            SourceUIPart(
-                type="source",
-                source=LanguageModelV1Source(
-                    sourceType="url",
-                    id=chat_conversation.messages[1].parts[2].source.id,
-                    url="sample.pdf",
-                    title=None,
-                    providerMetadata={},
-                ),
+            SourceUrlUIPart(
+                type="source-url",
+                sourceId=chat_conversation.messages[1].parts[2].sourceId,
+                url="sample.pdf",
             ),
         ],
     )
@@ -543,7 +467,7 @@ def test_post_conversation_with_document_upload(
 
     _run_id = chat_conversation.pydantic_messages[0]["run_id"]
     instruction_0 = chat_conversation.pydantic_messages[0]["instructions"]
-    _assert_document_instructions(instruction_0, today_prompt_date, "sample.pdf.md")
+    _assert_document_instructions(instruction_0, today_prompt_date, "sample.pdf")
 
     assert chat_conversation.pydantic_messages[0] == {
         "conversation_id": ANY,
@@ -558,6 +482,7 @@ def test_post_conversation_with_document_upload(
             },
         ],
         "run_id": _run_id,
+        "state": "complete",
         "timestamp": timezone_now,
     }
     assert chat_conversation.pydantic_messages[1] == {
@@ -597,7 +522,7 @@ def test_post_conversation_with_document_upload(
         "run_id": _run_id,
     }
     instruction_2 = chat_conversation.pydantic_messages[2]["instructions"]
-    _assert_document_instructions(instruction_2, today_prompt_date, "sample.pdf.md")
+    _assert_document_instructions(instruction_2, today_prompt_date, "sample.pdf")
     assert chat_conversation.pydantic_messages[2] == {
         "conversation_id": ANY,
         "instructions": instruction_2,
@@ -622,6 +547,7 @@ def test_post_conversation_with_document_upload(
             }
         ],
         "run_id": _run_id,
+        "state": "complete",
         "timestamp": timezone_now,
     }
     assert chat_conversation.pydantic_messages[3] == {
@@ -659,7 +585,7 @@ def test_post_conversation_with_document_upload(
     }
 
 
-@responses.activate
+@respx.mock
 @respx.mock
 @freeze_time("2025-07-25T10:36:35.297675Z")
 def test_post_conversation_with_document_upload_feature_disabled(
@@ -667,7 +593,6 @@ def test_post_conversation_with_document_upload_feature_disabled(
     api_client,
     caplog,
     mock_openai_stream,  # pylint: disable=unused-argument
-    sample_pdf_content,
     feature_flags,
 ):
     """
@@ -680,7 +605,11 @@ def test_post_conversation_with_document_upload_feature_disabled(
     chat_conversation = ChatConversationFactory()
     api_client.force_authenticate(user=chat_conversation.owner)
 
-    pdf_base64 = base64.b64encode(sample_pdf_content.read()).decode("utf-8")
+    # Feature disabled: the document is ignored before any parsing or storage
+    # read, so no attachment row or stored object is needed - only a valid
+    # `/media-key/` reference on the message.
+    document_url = f"/media-key/{chat_conversation.pk}/sample.pdf"
+
     message = UIMessage(
         id="1",
         role="user",
@@ -690,13 +619,9 @@ def test_post_conversation_with_document_upload_feature_disabled(
                 text="What does the document say?",
                 type="text",
             ),
-        ],
-        experimental_attachments=[
-            Attachment(
-                name="sample.pdf",
-                contentType="application/pdf",
-                url=f"data:application/pdf;base64,{pdf_base64}",
-            )
+            FileUIPart(
+                type="file", filename="sample.pdf", mediaType="application/pdf", url=document_url
+            ),
         ],
     )
 
@@ -708,7 +633,7 @@ def test_post_conversation_with_document_upload_feature_disabled(
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -717,17 +642,21 @@ def test_post_conversation_with_document_upload_feature_disabled(
     # Replace UUIDs with placeholders for assertion
     response_content = replace_uuids_with_placeholder(response_content)
     assert response_content == (
-        '0:"From the document, I can see that "\n'
-        "0:\"it says 'Hello PDF'.\"\n"
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":150,"completionTokens":25,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"From the document, I can see that "}\n'
+        "\n"
+        'data: {"type":"text-delta","id":"0","delta":"it says \'Hello PDF\'."}\n\n'
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":150,"completionTok'
+        'ens":25,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
     # This behavior must be improved in the future to inform the user properly
     assert "Document upload feature is disabled, ignoring input documents." in caplog.text
 
 
-@responses.activate
+@respx.mock
 @respx.mock
 @freeze_time()
 def test_post_conversation_with_document_upload_summarize(  # pylint: disable=too-many-arguments,too-many-positional-arguments  # noqa: PLR0913
@@ -744,7 +673,16 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
     chat_conversation = ChatConversationFactory(owner__language="en-us")
     api_client.force_authenticate(user=chat_conversation.owner)
 
-    pdf_base64 = base64.b64encode(sample_pdf_content.read()).decode("utf-8")
+    file_path = f"{chat_conversation.pk}/sample.pdf"
+    ChatConversationAttachmentFactory(  # Must be created by frontend
+        conversation=chat_conversation,
+        uploaded_by=chat_conversation.owner,
+        key=file_path,
+        file_name="sample.pdf",
+        content_type="application/pdf",
+    )
+    default_storage.save(file_path, sample_pdf_content)
+    document_url = f"/media-key/{chat_conversation.pk}/sample.pdf"
 
     message = UIMessage(
         id="1",
@@ -755,13 +693,9 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
                 text="Make a summary of this document.",
                 type="text",
             ),
-        ],
-        experimental_attachments=[
-            Attachment(
-                name="sample.pdf",
-                contentType="application/pdf",
-                url=f"data:application/pdf;base64,{pdf_base64}",
-            )
+            FileUIPart(
+                type="file", filename="sample.pdf", mediaType="application/pdf", url=document_url
+            ),
         ],
     )
 
@@ -786,7 +720,7 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -796,19 +730,25 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '9:{"toolCallId":"XXX","toolName":"document_parsing",'
-        '"args":{"documents":[{"identifier":"sample.pdf"}]}}\n'
-        'a:{"toolCallId":"XXX","result":{"state":"done"}}\n'
-        'b:{"toolCallId":"pyd_ai_YYY","toolName":"summarize"}\n'
-        '9:{"toolCallId":"pyd_ai_YYY","toolName":"summarize","args":{}}\n'
-        'h:{"sourceType":"url","id":"<mocked_uuid>","url":"sample.pdf.md",'
-        '"title":null,"providerMetadata":{}}\n'
-        'a:{"toolCallId":"pyd_ai_YYY","result":"The '
-        'document discusses various topics."}\n'
-        '0:"The document discusses various topics."\n'
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":287,"completionTokens":19,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"XXX","toolName":"document_parsing'
+        '","input":{"documents":[{"identifier":"sample.pdf"}]}}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"XXX","output":{"state":"done"}}'
+        "\n\n"
+        'data: {"type":"tool-input-start","toolCallId":"pyd_ai_YYY","toolName":"summarize"}\n'
+        "\n"
+        'data: {"type":"tool-input-available","toolCallId":"pyd_ai_YYY","toolName":"summarize'
+        '","input":{}}\n\n'
+        'data: {"type":"source-url","sourceId":"<mocked_uuid>","url":"sample.pdf.md"}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"pyd_ai_YYY","output":"The docume'
+        'nt discusses various topics."}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"The document discusses various topics."'
+        "}\n\n"
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":287,"completionTok'
+        'ens":19,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # Check that the conversation was updated
@@ -820,11 +760,7 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
         id=chat_conversation.messages[0].id,
         createdAt=timezone.now(),
         content="Make a summary of this document.",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="Make a summary of this document.")],
     )
 
@@ -833,32 +769,19 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
         id=chat_conversation.messages[1].id,
         createdAt=timezone.now(),
         content="The document discusses various topics.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
-            ToolInvocationUIPart(
-                type="tool-invocation",
-                toolInvocation=ToolInvocationCall(
-                    toolCallId=chat_conversation.messages[1].parts[0].toolInvocation.toolCallId,
-                    toolName="summarize",
-                    args={},
-                    state="call",
-                    step=None,
-                ),
+            ToolUIPart(
+                type="tool-summarize",
+                toolCallId=chat_conversation.messages[1].parts[0].toolCallId,
+                state="input-available",
+                input={},
             ),
             TextUIPart(type="text", text="The document discusses various topics."),
-            SourceUIPart(
-                type="source",
-                source=LanguageModelV1Source(
-                    sourceType="url",
-                    id=chat_conversation.messages[1].parts[2].source.id,
-                    url="sample.pdf.md",  # might be fixed in the future
-                    title=None,
-                    providerMetadata={},
-                ),
+            SourceUrlUIPart(
+                type="source-url",
+                sourceId=chat_conversation.messages[1].parts[2].sourceId,
+                url="sample.pdf.md",
             ),
         ],
     )
@@ -870,7 +793,7 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
 
     _run_id = chat_conversation.pydantic_messages[0]["run_id"]
     instruction_0 = chat_conversation.pydantic_messages[0]["instructions"]
-    _assert_document_instructions(instruction_0, today_prompt_date, "sample.pdf.md")
+    _assert_document_instructions(instruction_0, today_prompt_date, "sample.pdf")
     assert chat_conversation.pydantic_messages[0] == {
         "conversation_id": ANY,
         "instructions": instruction_0,
@@ -884,6 +807,7 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
             },
         ],
         "run_id": _run_id,
+        "state": "complete",
         "timestamp": timezone_now,
     }
     assert chat_conversation.pydantic_messages[1] == {
@@ -923,7 +847,7 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
         "run_id": _run_id,
     }
     instruction_2 = chat_conversation.pydantic_messages[2]["instructions"]
-    _assert_document_instructions(instruction_2, today_prompt_date, "sample.pdf.md")
+    _assert_document_instructions(instruction_2, today_prompt_date, "sample.pdf")
     assert chat_conversation.pydantic_messages[2] == {
         "conversation_id": ANY,
         "instructions": instruction_2,
@@ -942,6 +866,7 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
             }
         ],
         "run_id": _run_id,
+        "state": "complete",
         "timestamp": timezone_now,
     }
     assert chat_conversation.pydantic_messages[3] == {
@@ -979,7 +904,7 @@ def test_post_conversation_with_document_upload_summarize(  # pylint: disable=to
     }
 
 
-@responses.activate
+@respx.mock
 @respx.mock
 @freeze_time()
 def test_post_conversation_with_odt_document_upload(
@@ -996,7 +921,16 @@ def test_post_conversation_with_odt_document_upload(
     chat_conversation = ChatConversationFactory(owner__language="en-us")
     api_client.force_authenticate(user=chat_conversation.owner)
 
-    odt_base64 = base64.b64encode(sample_odt_content.read()).decode("utf-8")
+    file_path = f"{chat_conversation.pk}/sample.odt"
+    ChatConversationAttachmentFactory(  # Must be created by frontend
+        conversation=chat_conversation,
+        uploaded_by=chat_conversation.owner,
+        key=file_path,
+        file_name="sample.odt",
+        content_type="application/vnd.oasis.opendocument.text",
+    )
+    default_storage.save(file_path, sample_odt_content)
+    document_url = f"/media-key/{chat_conversation.pk}/sample.odt"
 
     message = UIMessage(
         id="1",
@@ -1007,13 +941,12 @@ def test_post_conversation_with_odt_document_upload(
                 text="What does the document say?",
                 type="text",
             ),
-        ],
-        experimental_attachments=[
-            Attachment(
-                name="sample.odt",
-                contentType="application/vnd.oasis.opendocument.text",
-                url=f"data:application/vnd.oasis.opendocument.text;base64,{odt_base64}",
-            )
+            FileUIPart(
+                type="file",
+                filename="sample.odt",
+                mediaType="application/vnd.oasis.opendocument.text",
+                url=document_url,
+            ),
         ],
     )
 
@@ -1038,7 +971,7 @@ def test_post_conversation_with_odt_document_upload(
 
     assert response.status_code == status.HTTP_200_OK
     assert response.get("Content-Type") == "text/event-stream"
-    assert response.get("x-vercel-ai-data-stream") == "v1"
+    assert response.get("x-vercel-ai-ui-message-stream") == "v1"
     assert response.streaming
 
     # Wait for the streaming content to be fully received
@@ -1048,20 +981,25 @@ def test_post_conversation_with_odt_document_upload(
     response_content = replace_uuids_with_placeholder(response_content)
 
     assert response_content == (
-        '9:{"toolCallId":"XXX","toolName":"document_parsing",'
-        '"args":{"documents":[{"identifier":"sample.odt"}]}}\n'
-        'a:{"toolCallId":"XXX","result":{"state":"done"}}\n'
-        'b:{"toolCallId":"pyd_ai_YYY","toolName":"document_search_rag"}\n'
-        '9:{"toolCallId":"pyd_ai_YYY","toolName":"document_search_rag",'
-        '"args":{"query":"What does the document say?"}}\n'
-        'h:{"sourceType":"url","id":"<mocked_uuid>","url":"sample.odt","title":null,'
-        '"providerMetadata":{}}\n'
-        'a:{"toolCallId":"pyd_ai_YYY","result":[{"url":"sample.odt","content":"This '
-        'is the content of the ODT.","score":0.9}]}\n'
-        "0:\"From the document, I can see that it says 'Hello ODT'.\"\n"
-        'f:{"messageId":"<mocked_uuid>"}\n'
-        'd:{"finishReason":"stop","usage":{"promptTokens":100,"completionTokens":20,'
-        '"co2Impact":0.0}}\n'
+        'data: {"type":"start","messageId":"<mocked_uuid>"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"XXX","toolName":"document_parsing'
+        '","input":{"documents":[{"identifier":"sample.odt"}]}}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"XXX","output":{"state":"done"}}'
+        "\n\n"
+        'data: {"type":"tool-input-start","toolCallId":"pyd_ai_YYY","toolName":"document_sear'
+        'ch_rag"}\n\n'
+        'data: {"type":"tool-input-available","toolCallId":"pyd_ai_YYY","toolName":"document_'
+        'search_rag","input":{"query":"What does the document say?"}}\n\n'
+        'data: {"type":"source-url","sourceId":"<mocked_uuid>","url":"sample.odt"}\n\n'
+        'data: {"type":"tool-output-available","toolCallId":"pyd_ai_YYY","output":[{"url":"sa'
+        'mple.odt","content":"This is the content of the ODT.","score":0.9}]}\n\n'
+        'data: {"type":"text-start","id":"0"}\n\n'
+        'data: {"type":"text-delta","id":"0","delta":"From the document, I can see that it sa'
+        "ys 'Hello ODT'.\"}\n\n"
+        'data: {"type":"text-end","id":"0"}\n\n'
+        'data: {"type":"finish","messageMetadata":{"usage":{"promptTokens":100,"completionTok'
+        'ens":20,"co2Impact":0.0}}}\n\n'
+        "data: [DONE]\n\n"
     )
 
     # Check that the conversation was updated
@@ -1073,11 +1011,7 @@ def test_post_conversation_with_odt_document_upload(
         id=chat_conversation.messages[0].id,
         createdAt=timezone.now(),
         content="What does the document say?",
-        reasoning=None,
-        experimental_attachments=None,
         role="user",
-        annotations=None,
-        toolInvocations=None,
         parts=[TextUIPart(type="text", text="What does the document say?")],
     )
 
@@ -1086,32 +1020,19 @@ def test_post_conversation_with_odt_document_upload(
         id=chat_conversation.messages[1].id,
         createdAt=timezone.now(),
         content="From the document, I can see that it says 'Hello ODT'.",
-        reasoning=None,
-        experimental_attachments=None,
         role="assistant",
-        annotations=None,
-        toolInvocations=None,
         parts=[
-            ToolInvocationUIPart(
-                type="tool-invocation",
-                toolInvocation=ToolInvocationCall(
-                    toolCallId=chat_conversation.messages[1].parts[0].toolInvocation.toolCallId,
-                    toolName="document_search_rag",
-                    args={"query": "What does the document say?"},
-                    state="call",
-                    step=None,
-                ),
+            ToolUIPart(
+                type="tool-document_search_rag",
+                toolCallId=chat_conversation.messages[1].parts[0].toolCallId,
+                state="input-available",
+                input={"query": "What does the document say?"},
             ),
             TextUIPart(type="text", text="From the document, I can see that it says 'Hello ODT'."),
-            SourceUIPart(
-                type="source",
-                source=LanguageModelV1Source(
-                    sourceType="url",
-                    id=chat_conversation.messages[1].parts[2].source.id,
-                    url="sample.odt",
-                    title=None,
-                    providerMetadata={},
-                ),
+            SourceUrlUIPart(
+                type="source-url",
+                sourceId=chat_conversation.messages[1].parts[2].sourceId,
+                url="sample.odt",
             ),
         ],
     )
@@ -1123,7 +1044,7 @@ def test_post_conversation_with_odt_document_upload(
 
     _run_id = chat_conversation.pydantic_messages[0]["run_id"]
     instruction_0 = chat_conversation.pydantic_messages[0]["instructions"]
-    _assert_document_instructions(instruction_0, today_prompt_date, "sample.odt.md")
+    _assert_document_instructions(instruction_0, today_prompt_date, "sample.odt")
 
     assert chat_conversation.pydantic_messages[0] == {
         "conversation_id": ANY,
@@ -1138,6 +1059,7 @@ def test_post_conversation_with_odt_document_upload(
             },
         ],
         "run_id": _run_id,
+        "state": "complete",
         "timestamp": timezone_now,
     }
     assert chat_conversation.pydantic_messages[1] == {
@@ -1177,7 +1099,7 @@ def test_post_conversation_with_odt_document_upload(
         "run_id": _run_id,
     }
     instruction_2 = chat_conversation.pydantic_messages[2]["instructions"]
-    _assert_document_instructions(instruction_2, today_prompt_date, "sample.odt.md")
+    _assert_document_instructions(instruction_2, today_prompt_date, "sample.odt")
     assert chat_conversation.pydantic_messages[2] == {
         "conversation_id": ANY,
         "instructions": instruction_2,
@@ -1202,6 +1124,7 @@ def test_post_conversation_with_odt_document_upload(
             }
         ],
         "run_id": _run_id,
+        "state": "complete",
         "timestamp": timezone_now,
     }
     assert chat_conversation.pydantic_messages[3] == {

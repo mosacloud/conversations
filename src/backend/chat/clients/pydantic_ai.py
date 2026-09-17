@@ -13,8 +13,8 @@ changes are needed in views.py or tests.
    If the conversation belongs to a project with custom LLM instructions,
    they are injected as a dynamic agent instruction.
 
-2. **Streaming Entry Points**: `stream_text()` or `stream_data()` are called
-   with user messages. These wrap async generators for sync consumption.
+2. **Streaming Entry Point**: `stream_data()` is called with user messages.
+   It wraps the async generator for sync consumption.
 
 3. **Agent Execution** (`_run_agent`):
    a. Validate last message is from user
@@ -40,8 +40,8 @@ Documents attached to messages go through several stages:
    - Validates document URLs belong to the conversation (security check)
    - Creates a vector store collection if none exists
    - For each document:
-     - Retrieves content from object storage
-     - Parses and stores in the vector store (chunked, embedded)
+     - Enqueues the parse + vector-store step on a Celery worker and blocks
+       on the result (the worker reads the file from object storage by key)
      - Creates a markdown attachment for non-text files
    - Emits tool call events so the UI shows parsing progress
 
@@ -54,13 +54,13 @@ Documents attached to messages go through several stages:
 
 Events flow through several layers:
 
-    _run_agent (yields events)
+    _run_agent (yields v4 events)
         ↓
-    _stream_content (applies encoder)
+    _stream_content (translates to v5, applies encoder)
         ↓
-    stream_text_async / stream_data_async
+    stream_data_async
         ↓
-    stream_text / stream_data (sync wrapper)
+    stream_data (sync wrapper)
 
 The `StreamingState` dataclass tracks mutable state across the streaming process:
 - `tool_is_streaming`: Prevents duplicate tool call events when streaming deltas
@@ -85,21 +85,21 @@ import time
 import uuid
 from contextlib import AsyncExitStack, ExitStack
 from io import BytesIO
-from typing import AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
+from typing import AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured
 from django.core.files.storage import default_storage
 from django.utils.module_loading import import_string
 from django.utils.translation import gettext_lazy as _
 
 from asgiref.sync import sync_to_async
+from celery.exceptions import TimeoutError as CeleryTimeoutError
 from langfuse import get_client, propagate_attributes
 from mistralai.client.errors import HTTPValidationError, SDKError
 from pydantic_ai import Agent, InstrumentationSettings, RunContext, RunUsage
-from pydantic_ai.capabilities import Instrumentation
+from pydantic_ai.capabilities import Instrumentation, ProcessHistory
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import (
     BinaryContent,
@@ -126,19 +126,28 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model, infer_model_profile
 
+from core.analytics import acapture_event
 from core.feature_flags.helpers import is_feature_enabled
 
 from chat import models
 from chat.agents.conversation import ConversationAgent, TitleGenerationAgent
-from chat.agents.history_processors import apply_sliding_window, resolve_conversation_budget
+from chat.agents.history_processors import (
+    SUMMARY_SYSTEM_PREFIX,
+    SummarizationRequiredError,
+    build_active_history,
+    resolve_conversation_budget,
+    safe_clean_tool_history,
+    should_generate_conversation_summary,
+)
 from chat.agents.local_media_url_processors import (
     build_project_image_urls,
+    project_has_image_attachments,
     update_history_local_urls,
     update_local_urls,
 )
 from chat.ai_sdk_types import (
-    LanguageModelV1Source,
-    SourceUIPart,
+    FileUIPart,
+    SourceUrlUIPart,
     UIMessage,
 )
 from chat.clients.async_to_sync import convert_async_generator_to_sync
@@ -157,21 +166,33 @@ from chat.clients.schema import (
     ContextDeps,
     DocumentParsingResult,
     ImagePostRunActions,
+    PreparedHistory,
     StreamingState,
 )
-from chat.constants import TEXT_MIME_PREFIX
+from chat.constants import (
+    ACCESS_FULL_CONTEXT,
+    HISTORY_SUMMARY_CLAIM_DEAD_GRACE_SECONDS,
+    HISTORY_SUMMARY_POLL_INTERVAL_SECONDS,
+    IMAGE_MIME_PREFIX,
+    MARKDOWN_MIME_TYPE,
+    SUMMARIZATION_ENQUEUE_CLAIM_GRACE_SECONDS,
+    TEXT_MIME_PREFIX,
+)
 from chat.document_context_builder import (
     DocumentsListing,
     build_documents_listing,
     render_listing,
 )
 from chat.enums import CollectionIndexState
+from chat.llm_configuration import get_model_configuration
 from chat.mcp_servers import get_mcp_servers
 from chat.rate_limiting import record_and_compute_cooldown
+from chat.tasks import parse_and_store_conversation_document_task, summarize_conversation_history
 from chat.tools.descriptions import (
     DOCUMENT_SUMMARIZE_PROJECT_TOOL_DESCRIPTION,
     DOCUMENT_SUMMARIZE_SYSTEM_PROMPT,
     DOCUMENT_SUMMARIZE_TOOL_DESCRIPTION,
+    GENERATE_PRESENTATION_TOOL_DESCRIPTION,
     SELF_DOCUMENTATION_SYSTEM_PROMPT,
     SELF_DOCUMENTATION_TOOL_DESCRIPTION,
     WEB_SEARCH_TOOL_DESCRIPTION,
@@ -179,9 +200,12 @@ from chat.tools.descriptions import (
 from chat.tools.document_generic_search_rag import add_document_rag_search_tool_from_setting
 from chat.tools.document_search_rag import add_document_rag_search_tool
 from chat.tools.document_summarize import document_summarize, document_summarize_project
+from chat.tools.generate_presentation import generate_presentation
 from chat.tools.self_documentation import build_self_documentation_payload
 from chat.vercel_ai_sdk.core import events_v4, events_v5
 from chat.vercel_ai_sdk.encoder import CURRENT_EVENT_ENCODER_VERSION, EventEncoder
+from chat.vercel_ai_sdk.encoder.encoder import DONE_FRAME
+from chat.vercel_ai_sdk.encoder.v4_to_v5 import V4ToV5Translator
 
 # Keep at the top of the file to avoid mocking issues
 document_store_backend = import_string(settings.RAG_DOCUMENT_SEARCH_BACKEND)
@@ -193,13 +217,12 @@ User = get_user_model()
 CACHE_TIMEOUT = 30 * 60  # 30 minutes timeout
 DOCUMENT_URL_PREFIX = "/media-key/"
 
-
-def get_model_configuration(model_hrid: str):
-    """Get the model configuration from settings."""
-    try:
-        return settings.LLM_CONFIGURATIONS[model_hrid]
-    except KeyError as exc:
-        raise ImproperlyConfigured(f"LLM model configuration '{model_hrid}' not found.") from exc
+# Stream-protocol contract with the frontend. Mirrored in
+# ``useChat.tsx`` (``IMAGES_SKIPPED_EVENT_TYPE`` /
+# ``IMAGE_SKIP_REASON_TEXT_ONLY``). Keep both sides in sync when adding new
+# reasons or events.
+IMAGES_SKIPPED_EVENT_TYPE = "images_skipped"
+IMAGE_SKIP_REASON_TEXT_ONLY = "model_text_only"
 
 
 def _strip_thinking_parts(history: list[ModelMessage]) -> list[ModelMessage]:
@@ -232,6 +255,25 @@ def _strip_thinking_parts(history: list[ModelMessage]) -> list[ModelMessage]:
             )
         result.append(message)
     return result
+
+
+def iter_image_attachments(messages: list[UIMessage]):
+    """Yield each image-like file part across the given messages.
+
+    Single source of truth for the "is this attachment an image?" predicate
+    used by readers (``list_images``) and writers (``_mark_image_attachments_skipped``).
+    """
+    for message in messages:
+        for part in message.parts or []:
+            if isinstance(part, FileUIPart) and (part.mediaType or "").startswith(
+                IMAGE_MIME_PREFIX
+            ):
+                yield part
+
+
+def list_images(messages: list[UIMessage]) -> list[str]:
+    """Return names of every image attachment across the message history."""
+    return [part.filename for part in iter_image_attachments(messages) if part.filename]
 
 
 def _extract_co2_from_usage(usage: RunUsage) -> float:
@@ -268,21 +310,33 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         self.conversation = conversation
         self.user = user  # authenticated user only
         self.model_hrid = model_hrid or settings.LLM_DEFAULT_MODEL_HRID  # HRID of the model to use
+        self.model_configuration = get_model_configuration(self.model_hrid)
         self.language = language  # might be None
         self._last_stop_check = 0
+        # Events queued during _prepare_agent_run for _run_agent to yield before
+        # the model is actually called (e.g. images-skipped notices). The list is
+        # cleared at the start of every stream via _clean.
+        self._pre_stream_events: List[dict] = []
 
         self._langfuse_available = settings.LANGFUSE_ENABLED
         self._store_analytics = self._langfuse_available and user.allow_conversation_analytics
         self._langfuse_span = None
-        self.event_encoder = EventEncoder(CURRENT_EVENT_ENCODER_VERSION)  # We use v4 for now
+        self.event_encoder = EventEncoder(CURRENT_EVENT_ENCODER_VERSION)
+        # Id of the assistant message of the current stream, announced to the
+        # client in the `start` frame and persisted with the message. Set per
+        # stream by _stream_content.
+        self._model_response_message_id: str | None = None
 
         self._support_streaming = True
-        if (streaming := get_model_configuration(self.model_hrid).supports_streaming) is not None:
+        if (streaming := self.model_configuration.supports_streaming) is not None:
             self._support_streaming = streaming
 
         # Feature flags
         self._is_document_upload_enabled = is_feature_enabled(self.user, "document_upload")
         self._is_web_search_enabled = is_feature_enabled(self.user, "web_search")
+        self._is_presentation_generation_enabled = is_feature_enabled(
+            self.user, "presentation_generation"
+        )
         self._is_smart_search_enabled = user.allow_smart_web_search
         self._fake_streaming_delay = settings.FAKE_STREAMING_DELAY
 
@@ -294,19 +348,26 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         )
         self._web_search_tool_registered = False
         self._self_documentation_tool_registered = False
+        self._history_summary = conversation.history_summary.strip() or None
+        self._history_summary_checkpoint = max(conversation.history_summary_checkpoint, 0)
+        self._presentation_tool_registered = False
 
-        _capabilities = (
-            [
+        _capabilities: list = [ProcessHistory(safe_clean_tool_history)]
+        if self._langfuse_available:
+            _capabilities.append(
                 Instrumentation(
                     settings=InstrumentationSettings(
                         include_binary_content=self._store_analytics,
                         include_content=self._store_analytics,
+                        # Pin the OpenTelemetry schema pydantic-ai emitted before 2.x
+                        # (default is now version 5 with `gen_ai.aggregated_usage.*`
+                        # attribute names). Keeps existing Langfuse dashboards working;
+                        # moving to the newer schema is a separate, deliberate change.
+                        version=2,
+                        use_aggregated_usage_attribute_names=False,
                     )
                 )
-            ]
-            if self._langfuse_available
-            else []
-        )
+            )
         self.conversation_agent = ConversationAgent(
             model_hrid=self.model_hrid,
             language=self.language,
@@ -314,6 +375,9 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
             deps_type=ContextDeps,
         )
         add_document_rag_search_tool_from_setting(self.conversation_agent, self.user)
+        self._conversation_message_token_budget = resolve_conversation_budget(
+            self.model_configuration
+        )
 
         # Inject project-level custom instructions if the conversation belongs to a project
         llm_user_instructions = (
@@ -325,19 +389,24 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
 
             @self.conversation_agent.instructions
             def project_instructions() -> str:
+                """Inject the project's custom user instructions."""
                 return llm_user_instructions
+
+        @self.conversation_agent.instructions
+        def history_summary_instructions() -> str:
+            """Inject the stored conversation summary as context-only instructions."""
+            if not self._history_summary:
+                return ""
+            return f"{SUMMARY_SYSTEM_PREFIX}{self._history_summary.strip()}"
 
     @property
     def _stop_cache_key(self):
+        """Cache key holding the stop signal for this conversation's stream."""
         return f"streaming:stop:{self.conversation.pk}"
 
     # --------------------------------------------------------------------- #
     # Public streaming API (unchanged signatures)
     # --------------------------------------------------------------------- #
-
-    def stream_text(self, messages: List[UIMessage], force_web_search: bool = False):
-        """Return only the assistant text deltas (legacy text mode)."""
-        return convert_async_generator_to_sync(self.stream_text_async(messages, force_web_search))
 
     def stream_data(self, messages: List[UIMessage], force_web_search: bool = False):
         """Return Vercel-AI-SDK formatted events."""
@@ -369,11 +438,79 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         self.conversation.messages = list(self.conversation.messages) + [user_message]
         await sync_to_async(self.conversation.save)(update_fields=["messages"])
 
-    async def _stream_content(
-        self, messages: List[UIMessage], force_web_search: bool = False, encoder_fn: Callable = None
+    @staticmethod
+    def _mark_image_attachments_skipped(user_message: UIMessage) -> bool:
+        """Stamp a ``skipped`` marker on every image-like file part.
+
+        Returns True if at least one attachment was marked. The persisted user
+        bubble keeps the image attachments (filenames + URLs) so the frontend
+        can render a "removed: model can't read images" chip on reload; we just
+        flag each so renderers know not to fetch the image and to show the chip
+        instead of the thumbnail.
+        """
+        marked = False
+        for attachment in iter_image_attachments([user_message]):
+            if attachment.skipped is None:
+                attachment.skipped = {"reason": IMAGE_SKIP_REASON_TEXT_ONLY}
+                marked = True
+        return marked
+
+    async def _persist_user_message_for_image_skip(self, user_message: UIMessage) -> None:
+        """Persist the inbound user message early so it carries the skipped marker.
+
+        ``_prepare_update_conversation`` normally rebuilds the user bubble from
+        the agent's final_output; that path silently drops attachments the agent
+        never saw (because we stripped them), losing the filenames the frontend
+        needs to render the "image removed" chip. By saving the original message
+        here (with markers already stamped), the rebuild step short-circuits via
+        the "last message is user" guard and the marked version stands.
+        """
+        if self.conversation.messages and self.conversation.messages[-1].role == "user":
+            return
+        self.conversation.messages = list(self.conversation.messages) + [user_message]
+        await sync_to_async(self.conversation.save)(update_fields=["messages"])
+
+    def _add_unreadable_images_instruction(self, subject: Optional[str]) -> None:
+        """Tell a text-only model an image is present that it cannot read.
+
+        The model receives the image parts but ignores them; this instruction makes
+        it aware an image was provided so it can say it can't read images rather than
+        answer obliviously. ``subject`` names the image(s), e.g. ``"sample.png"`` or
+        ``"an image in the current project"``.
+        """
+
+        @self.conversation_agent.instructions
+        def acknowledge_unreadable_images() -> str:
+            """Instruct the model to tell the user it cannot read attached images."""
+            return (
+                f"This conversation includes {subject or 'some images'}, but you cannot read or "
+                "process images. If a request depends on it, tell the user you "
+                "can't read images."
+            )
+
+    def _new_model_response_message_id(self) -> str:
+        """Build the id of the assistant message about to be streamed.
+
+        Prefixed with the Langfuse trace id when tracing is on: the frontend
+        keys its feedback buttons on that prefix to score the exact trace. The
+        id is minted at stream start because v5 pins the message identity on the
+        `start` frame — changing it mid-stream would fork the message in two.
+        """
+        if not self._langfuse_available:
+            return str(uuid.uuid4())
+        trace_id = get_client().get_current_trace_id()
+        if not trace_id:
+            # No active trace: a `trace-None` id would make the frontend offer
+            # feedback buttons that score a trace which does not exist.
+            return str(uuid.uuid4())
+        return f"trace-{trace_id}"
+
+    async def _stream_content(  # noqa: PLR0912  # pylint: disable=too-many-branches
+        self, messages: List[UIMessage], force_web_search: bool = False
     ):
-        """Common streaming logic with configurable encoder."""
+        """Stream the agent run as a Vercel AI SDK UI message stream."""
         await self._clean()
+        translator = V4ToV5Translator()
         with ExitStack() as stack:
             if self._langfuse_available:
                 stack.enter_context(
@@ -389,10 +526,15 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
                     get_client().start_as_current_observation(name="conversation", as_type="span")
                 )
 
+            self._model_response_message_id = self._new_model_response_message_id()
+            yield self.event_encoder.encode(
+                events_v5.MessageStartEvent(messageId=self._model_response_message_id)
+            )
+
             try:
                 async for event in self._run_agent(messages, force_web_search):
-                    if stream_text := encoder_fn(event):
-                        yield stream_text
+                    for translated in translator.translate(event):
+                        yield self.event_encoder.encode(translated)
             except (ModelHTTPError, HTTPValidationError, SDKError) as exc:
                 # HTTPValidationError and SDKError are mistral-specific exceptions not
                 # wrapped by pydantic_ai into ModelHTTPError.
@@ -411,10 +553,8 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
                 if messages:
                     await self._persist_user_message_on_error(messages[-1])
                 error_event = events_v4.ErrorPart(error=error_code)
-                if encoded := encoder_fn(error_event):
-                    yield encoded
-                else:
-                    raise
+                for translated in translator.translate(error_event):
+                    yield self.event_encoder.encode(translated)
             except ModelAPIError as exc:
                 logger.warning(
                     "LLM provider connection error for conversation %s: %s",
@@ -424,24 +564,28 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
                 if messages:
                     await self._persist_user_message_on_error(messages[-1])
                 error_event = events_v4.ErrorPart(error="model_connection_error")
-                if encoded := encoder_fn(error_event):
-                    yield encoded
-                else:
-                    raise
+                for translated in translator.translate(error_event):
+                    yield self.event_encoder.encode(translated)
+            except SummarizationRequiredError as exc:
+                logger.error(
+                    "Summarization required but failed for conversation %s: %s",
+                    self.conversation.pk,
+                    exc,
+                )
+                if messages:
+                    await self._persist_user_message_on_error(messages[-1])
+                error_event = events_v4.ErrorPart(error="summarization_failed")
+                for translated in translator.translate(error_event):
+                    yield self.event_encoder.encode(translated)
 
-    async def stream_text_async(self, messages: List[UIMessage], force_web_search: bool = False):
-        """Return only the assistant text deltas (legacy text mode)."""
-        async for chunk in self._stream_content(
-            messages, force_web_search, encoder_fn=self.event_encoder.encode_text
-        ):
-            yield chunk
+            for translated in translator.flush():
+                yield self.event_encoder.encode(translated)
+            yield DONE_FRAME
 
     async def stream_data_async(self, messages: List[UIMessage], force_web_search: bool = False):
         """Return Vercel-AI-SDK formatted events."""
 
-        async for chunk in self._stream_content(
-            messages, force_web_search, encoder_fn=self.event_encoder.encode
-        ):
+        async for chunk in self._stream_content(messages, force_web_search):
             yield chunk
 
     async def _agent_stop_streaming(self, force_cache_check: Optional[bool] = False) -> None:
@@ -469,6 +613,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         It can be used to release resources or perform any necessary cleanup.
         """
         self._last_stop_check = 0
+        self._pre_stream_events = []
         await cache.adelete(self._stop_cache_key)
 
     # --------------------------------------------------------------------- #
@@ -508,13 +653,56 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
 
         model = self.conversation_agent.model
         if isinstance(model, Model):
-            model_supports_thinking = model.profile.supports_thinking
+            model_supports_thinking = model.profile.get("supports_thinking")
         else:
-            model_supports_thinking = infer_model_profile(model).supports_thinking
+            model_supports_thinking = infer_model_profile(model).get("supports_thinking")
         if not model_supports_thinking:
             history = _strip_thinking_parts(history)
 
         user_prompt, input_images, input_documents = self._prepare_prompt(messages[-1])
+
+        # If the resolved model can't accept images, the model still receives them
+        # but ignores them (these endpoints tolerate image parts), and we instruct
+        # it to say so. We keep the images in the payload so they persist to history
+        # and a later turn on a vision-capable model can read them. We also mark each
+        # image attachment on the persisted user message so the frontend can render
+        # an inline "image ignored" chip naming the file.
+        model_supports_image = self.conversation_agent.configuration.supports_image
+        ignored_images = []
+        if not model_supports_image:
+            image_names = list_images(messages)
+            ignored_images += image_names
+            if await project_has_image_attachments(self.conversation.project_id):
+                ignored_images += ["images in the current project"]
+            if ignored_images:
+                # Single chat-wide notice: any image (project or history) is
+                # ignored by this text-only model.
+                self._pre_stream_events.append(
+                    {
+                        "type": IMAGES_SKIPPED_EVENT_TYPE,
+                        "kind": "chat_notice",
+                        "reason": IMAGE_SKIP_REASON_TEXT_ONLY,
+                    }
+                )
+
+        if ignored_images:
+            logger.info(
+                "Model %s cannot read images; instructing it to ignore %d image(s) "
+                "on conversation %s",
+                self.model_hrid,
+                len(input_images),
+                self.conversation.pk,
+            )
+            self._add_unreadable_images_instruction(", ".join(ignored_images))
+            if self._mark_image_attachments_skipped(messages[-1]):
+                await self._persist_user_message_for_image_skip(messages[-1])
+                self._pre_stream_events.append(
+                    {
+                        "type": IMAGES_SKIPPED_EVENT_TYPE,
+                        "kind": "last_message_marked",
+                        "reason": IMAGE_SKIP_REASON_TEXT_ONLY,
+                    }
+                )
 
         image_actions = ImagePostRunActions()
         if input_images:
@@ -532,10 +720,11 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         # finalize/persistence path strips them from `new_messages` before
         # writing to history - otherwise every turn would accumulate them in
         # `pydantic_messages` and replay them on every reload.
-        project_image_urls = await build_project_image_urls(self.conversation.project_id)
-        if project_image_urls:
-            input_images = list(input_images) + project_image_urls
-            image_actions.drop.update(img.url for img in project_image_urls)
+        if model_supports_image:
+            project_image_urls = await build_project_image_urls(self.conversation.project_id)
+            if project_image_urls:
+                input_images = list(input_images) + project_image_urls
+                image_actions.drop.update(img.url for img in project_image_urls)
 
         if self._langfuse_available and self._langfuse_span is not None:
             self._langfuse_span.update(
@@ -563,6 +752,145 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
             history,
             conversation_has_own_documents,
         )
+
+    def _build_model_history(self, history: list[ModelMessage]) -> list[ModelMessage]:
+        """Compact tool cycles and trim to the runtime window for this turn.
+
+        Pure transformation of the message list sent to the model: no LLM, no
+        DB writes. The summarized prefix is represented by the persisted summary
+        (injected via dynamic instructions), not by these messages.
+        """
+        cleaned_history = safe_clean_tool_history(history)
+        return build_active_history(
+            cleaned_history,
+            self._history_summary_checkpoint,
+            settings.CONVERSATION_SUMMARY_CONTEXT_MESSAGES,
+            self._conversation_message_token_budget,
+        )
+
+    async def _wait_for_history_summary(
+        self,
+        claim_deadline: float | None = None,
+    ) -> AsyncGenerator[events_v4.DataPart, None]:
+        """Wait for the summarization task while its claim is live.
+
+        Yields keep-alive data parts so proxies don't kill the idle SSE
+        stream. Returns when the summary lands (checkpoint advanced past
+        ours), or once the claim has been dead *continuously* for
+        ``HISTORY_SUMMARY_CLAIM_DEAD_GRACE_SECONDS`` and, when
+        ``claim_deadline`` (monotonic clock) is given, that deadline has also
+        passed without a worker claiming.
+
+        The dead-claim grace exists because the task releases its claim in
+        `finally` even when Celery is about to retry it: without the grace the
+        turn would fail during a retry backoff that was about to succeed. A
+        reappearing claim resets the grace, so each retry attempt is waited out
+        afresh — bounded overall by the claim TTL per attempt.
+        """
+        claim_dead_since: float | None = None
+        while True:
+            await self.conversation.arefresh_from_db(
+                fields=[
+                    "history_summary",
+                    "history_summary_checkpoint",
+                    "history_summary_claimed_at",
+                ]
+            )
+            if self.conversation.history_summary_checkpoint > self._history_summary_checkpoint:
+                return
+            now = time.monotonic()
+            if self.conversation.history_summarization_claim_is_live:
+                claim_dead_since = None
+            else:
+                if claim_dead_since is None:
+                    claim_dead_since = now
+                if now - claim_dead_since >= HISTORY_SUMMARY_CLAIM_DEAD_GRACE_SECONDS and (
+                    claim_deadline is None or now >= claim_deadline
+                ):
+                    return
+            yield events_v4.DataPart(data=[{"type": "keep_alive"}])
+            await asyncio.sleep(HISTORY_SUMMARY_POLL_INTERVAL_SECONDS)
+
+    async def _run_history_summary_phase(
+        self, history: list[ModelMessage]
+    ) -> AsyncGenerator[events_v4.Event | PreparedHistory, None]:
+        """Run the conversation-summary phase, then trim the history.
+
+        This runs before agent.iter so dynamic instructions can read the
+        updated summary in the same model request. When the message budget is
+        exceeded it emits a visible `summarize` tool call (running -> done) and
+        blocks the turn while a Celery worker generates the summary: enqueue the
+        task, wait on its claim, then adopt whatever landed. Generation is
+        Celery-only — if no summary lands (worker down) and the turn is still
+        over budget, it raises `SummarizationRequiredError` rather than answering
+        with degraded context. Always trims the history and yields the result as
+        the final item (the `DocumentParsingResult` sentinel pattern).
+        """
+        should_emit_summary_event = should_generate_conversation_summary(
+            history,
+            summary_checkpoint=self._history_summary_checkpoint,
+            message_token_budget=self._conversation_message_token_budget,
+            context_messages=settings.CONVERSATION_SUMMARY_CONTEXT_MESSAGES,
+        )
+        if should_emit_summary_event:
+            tool_call_id = str(uuid.uuid4())
+            summarization_started_at = time.monotonic()
+            # Reported before the yield: the consumer may drop the stream there,
+            # which would kill this generator and lose the start of the funnel.
+            await acapture_event(
+                "conversation_summarization_started",
+                self.user.pk,
+                properties={"conversation_id": str(self.conversation.pk)},
+            )
+            yield events_v4.ToolCallPart(
+                tool_call_id=tool_call_id,
+                tool_name="summarize",
+                args={"state": "running", "summary_scope": "conversation"},
+            )
+            claim_deadline = None
+            if not self.conversation.history_summarization_claim_is_live:
+                # Nobody is generating: enqueue the task (the summarized prefix
+                # predates this turn, so DB state is current), then give the
+                # worker a grace window to pick it up and claim.
+                await sync_to_async(summarize_conversation_history.delay)(str(self.conversation.pk))
+                claim_deadline = time.monotonic() + SUMMARIZATION_ENQUEUE_CLAIM_GRACE_SECONDS
+            async for keep_alive in self._wait_for_history_summary(claim_deadline=claim_deadline):
+                yield keep_alive
+            # Adopt whatever landed while we waited.
+            self._history_summary = self.conversation.history_summary.strip() or None
+            self._history_summary_checkpoint = max(self.conversation.history_summary_checkpoint, 0)
+            if should_generate_conversation_summary(
+                history,
+                summary_checkpoint=self._history_summary_checkpoint,
+                message_token_budget=self._conversation_message_token_budget,
+                context_messages=settings.CONVERSATION_SUMMARY_CONTEXT_MESSAGES,
+            ):
+                # No summary landed and still over budget: no degraded turn.
+                await acapture_event(
+                    "conversation_summarization_failed",
+                    self.user.pk,
+                    properties={
+                        "conversation_id": str(self.conversation.pk),
+                        "waited_seconds": round(time.monotonic() - summarization_started_at, 3),
+                    },
+                )
+                raise SummarizationRequiredError(
+                    "Conversation summary did not land while the history exceeds the budget."
+                )
+            await acapture_event(
+                "conversation_summarization_succeeded",
+                self.user.pk,
+                properties={
+                    "conversation_id": str(self.conversation.pk),
+                    "waited_seconds": round(time.monotonic() - summarization_started_at, 3),
+                },
+            )
+            yield events_v4.ToolResultPart(
+                tool_call_id=tool_call_id,
+                result={"state": "done"},
+            )
+
+        yield PreparedHistory(history=self._build_model_history(history))
 
     def _setup_web_search(self, force_web_search: bool) -> bool:
         """Configure web search if forced. Returns whether web search is actually
@@ -632,7 +960,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         return False
 
     async def _process_agent_nodes(
-        self, run, state: StreamingState, langfuse
+        self, run, state: StreamingState
     ) -> AsyncGenerator[events_v4.Event, None]:
         """
         Process nodes from the Pydantic-AI agent iteration loop.
@@ -647,8 +975,8 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
           - Executes tools and yields results
           - Collects source citations into state.ui_sources
         - **EndNode**: The agent run is complete
-          - Sets state.model_response_message_id for Langfuse linking
-          - Yields StartStepPart with the message ID
+          - Sets state.model_response_message_id (minted at stream start) so
+            the persisted message keeps the id the client was given
 
         This method delegates to specialized handlers for each node type,
         passing the shared StreamingState to track cross-node state.
@@ -676,7 +1004,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
             elif Agent.is_end_node(node):
                 # Once an End node is reached, the agent run is complete
                 logger.debug("v: %s", dataclasses.asdict(node))
-                yield self._handle_end_node(node, langfuse, state)
+                self._handle_end_node(node, state)
 
     async def _fetch_document_data(
         self, document: "BinaryContent | DocumentUrl"
@@ -688,6 +1016,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
             key = document.url[len(DOCUMENT_URL_PREFIX) :]
 
             def _read():
+                """Read the document's raw bytes from object storage."""
                 with default_storage.open(key, "rb") as file:
                     return file.read()
 
@@ -702,23 +1031,29 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         1. Validates all document URLs belong to this conversation (security)
         2. Creates a vector store collection if one doesn't exist
         3. For each document:
-             - Retrieves content from object storage (for DocumentUrl)
-             - Parses the document (extracts text, chunks it)
-             - Stores chunks with embeddings in the vector store
+             - Enqueues the parse + RAG store on a Celery worker (reading the
+               file from storage by key) and blocks on the result
+             - Persists the backend document id on the attachment row
              - Creates a markdown attachment for non-text files (PDF → MD)
 
         Security: Documents are validated to ensure their URLs match the pattern
          `/media-key/{conversation_pk}/...` to prevent cross-conversation access.
 
-        The actual parsing runs in a thread pool (asyncio.to_thread) to avoid
-        blocking the event loop during potentially slow document processing.
+        The parse + store runs in the `parse_and_store_conversation_document_task`
+        Celery task rather than in-process, so the heavy, hostile-input-exposed
+        work is off the request process and capped by the Celery task time limits.
+        The turn blocks on the task result, so the UX is unchanged.
+
+        Only stored documents (DocumentUrl) are supported; inline BinaryContent
+        has no storage key for the worker to read and is rejected.
 
         Args:
-            documents: List of BinaryContent (inline data) or DocumentUrl (storage reference)
+            documents: List of DocumentUrl (storage reference). BinaryContent is rejected.
 
         Raises:
             ValueError: If document URL doesn't belong to this conversation
             ValueError: If external URLs are provided (not yet supported)
+            ValueError: If a document is inline BinaryContent (unsupported)
         """
 
         # Early external document URL rejection
@@ -746,35 +1081,68 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
 
         any_indexed = False
         for document in documents:
-            key, content = await self._fetch_document_data(document)
-            parsed_content, rag_document_id = await asyncio.to_thread(
-                document_store.parse_and_store_document,
-                name=document.identifier,
-                content_type=document.media_type,
-                content=content,
-                user_sub=self.user.sub,
-            )
+            if not isinstance(document, DocumentUrl):
+                # Inline document bytes (BinaryContent) are not produced by the
+                # chat UI, which always uploads to storage first. Only a stored
+                # document can be parsed off-process by the Celery task, which
+                # reads the file from storage by key.
+                raise ValueError("Inline document content is not supported for parsing.")
 
-            # Persist the backend-side document id on the original attachment row
-            # (only for files uploaded via presigned URL — BinaryContent inlines
-            # have no row to update; their id falls through to the md companion).
+            # Extract the storage key; the guard above already asserted every
+            # DocumentUrl belongs to this conversation.
+            key = document.url[len(DOCUMENT_URL_PREFIX) :]
+
+            # Offload parse + RAG store to a Celery worker so the heavy,
+            # hostile-input-exposed work runs off the request process and under
+            # the task time limits. The turn blocks on the result (UX unchanged):
+            # a timeout or parse error propagates out and is surfaced by the
+            # caller's error handling.
+            # The publish is a synchronous Redis round trip, so run it in a
+            # thread like the `.get()`/`.forget()` below to keep the event
+            # loop free for other streams.
+            async_result = await asyncio.to_thread(
+                parse_and_store_conversation_document_task.delay,
+                self.conversation.collection_id,
+                key,
+                document.identifier,
+                document.media_type,
+                self.user.sub,
+            )
+            try:
+                parsed_content, rag_document_id = await asyncio.to_thread(
+                    async_result.get,
+                    timeout=settings.DOCUMENT_PARSE_RESULT_TIMEOUT_SECONDS,
+                )
+            except CeleryTimeoutError:
+                # The task may still be waiting in the queue; revoke it so it
+                # doesn't run (and store chunks) after the user has already seen
+                # this turn fail. A task that is already executing is not stopped
+                # by revoke; the Celery hard time limit caps it instead.
+                await asyncio.to_thread(async_result.revoke)
+                raise
+            finally:
+                # Drop the (possibly large) parsed-content payload from the result
+                # backend once the task has finished: it has been consumed on
+                # success, and is useless on failure. If the task is still queued
+                # or running (timeout path above), a result written later sits in
+                # Redis until CELERY_RESULT_EXPIRES.
+                await asyncio.to_thread(async_result.forget)
+
+            # Persist the backend-side document id on the original attachment row.
             if rag_document_id:
                 any_indexed = True
-                if key:
-                    await models.ChatConversationAttachment.objects.filter(
-                        conversation_id=self.conversation.pk, key=key
-                    ).aupdate(rag_document_id=rag_document_id, is_indexed=True)
+                await models.ChatConversationAttachment.objects.filter(
+                    conversation_id=self.conversation.pk, key=key
+                ).aupdate(rag_document_id=rag_document_id, is_indexed=True)
 
             if not document.media_type.startswith(TEXT_MIME_PREFIX):
                 md_attachment = await models.ChatConversationAttachment.objects.acreate(
                     conversation=self.conversation,
                     uploaded_by=self.user,
-                    key=key or f"{self.conversation.pk}/attachments/{document.identifier}.md",
+                    key=key,
                     file_name=f"{document.identifier}.md",
-                    content_type="text/markdown",
-                    conversion_from=key,  # might be None
-                    # No row exists for inline BinaryContent; carry the id here.
-                    rag_document_id=rag_document_id if not key else None,
+                    content_type=MARKDOWN_MIME_TYPE,
+                    conversion_from=key,
                 )
                 default_storage.save(md_attachment.key, BytesIO(parsed_content.encode("utf8")))
                 md_attachment.upload_state = models.AttachmentStatus.READY
@@ -836,6 +1204,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         return user_prompt[0], attachment_images, attachment_documents
 
     async def _build_documents_listing(self) -> DocumentsListing | None:
+        """Assemble the per-turn document listing (inlined vs tool-call-only)."""
         budget_ratio = settings.DOCUMENT_CONTEXT_BUDGET_RATIO
         security_buffer_tokens = settings.DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS
         # Restrict to READY uploads on both arms: PENDING / ANALYZING /
@@ -857,7 +1226,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
                     upload_state=models.AttachmentStatus.READY,
                 ).order_by("created_at", "id")
             )
-        max_token_context = self.conversation_agent.configuration.max_token_context
+        max_token_context = self.model_configuration.max_token_context
 
         # Cache the DocumentsListing: building it requires reading every text
         # attachment from object storage and tokenizing it. The fingerprint includes
@@ -895,6 +1264,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         return listing
 
     async def _build_document_context_instruction(self) -> str:
+        """Render the document listing into a system-prompt instruction string."""
         listing = await self._build_documents_listing()
         return render_listing(listing) if listing is not None else ""
 
@@ -904,11 +1274,13 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
 
         @self.conversation_agent.instructions
         def summarization_system_prompt() -> str:
+            """Inject the document-summarization system prompt."""
             return DOCUMENT_SUMMARIZE_SYSTEM_PROMPT
 
         # Inform the model (system-level) that documents are attached and available
         @self.conversation_agent.instructions
         def attached_documents_note() -> str:
+            """Inform the model that user documents are attached and available."""
             base_note = (
                 "[Internal context] User documents are attached to this conversation. "
                 "Do not request re-upload of documents; consider them already available "
@@ -970,6 +1342,23 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
 
         self._web_search_tool_registered = True
 
+    def _setup_presentation_tool(self) -> None:
+        """Register the slide deck generation tool when the feature is enabled."""
+        if self._presentation_tool_registered or not self._is_presentation_generation_enabled:
+            return
+
+        @self.conversation_agent.tool(
+            name="generate_presentation",
+            retries=1,
+            description=GENERATE_PRESENTATION_TOOL_DESCRIPTION,
+        )
+        @functools.wraps(generate_presentation)
+        async def generate_presentation_tool(ctx: RunContext, *args, **kwargs) -> ToolReturn:
+            """Wrap the generate_presentation tool to provide context and add the tool."""
+            return await generate_presentation(ctx, *args, **kwargs)
+
+        self._presentation_tool_registered = True
+
     def _setup_self_documentation_tool(self) -> None:
         """Register a tool exposing static and runtime self-documentation metadata."""
         if self._self_documentation_tool_registered:
@@ -977,6 +1366,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
 
         @self.conversation_agent.instructions
         def self_documentation_instruction() -> str:
+            """Inject the self-documentation system prompt."""
             return SELF_DOCUMENTATION_SYSTEM_PROMPT
 
         @self.conversation_agent.tool(
@@ -1070,6 +1460,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         yield DocumentParsingResult(success=True, has_documents=True)
 
     async def _handle_non_streaming_response(self, node, run_ctx):
+        """Run a model node without streaming, emitting its parts as events."""
         result = await node.run(run_ctx)
         logger.debug("node.run result: %s", result)
         for part in result.model_response.parts:
@@ -1097,6 +1488,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
                 logger.warning("Unknown part type: %s %s", type(part), dataclasses.asdict(part))
 
     async def _handle_streaming_response(self, node, run_ctx, state: StreamingState):
+        """Stream a model node, emitting text/tool/reasoning deltas as events."""
         async with node.stream(run_ctx) as request_stream:
             async for event in request_stream:
                 await self._agent_stop_streaming()
@@ -1137,6 +1529,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
     async def _handle_call_tools_node(
         self, node, run_ctx, state: StreamingState
     ) -> AsyncGenerator[events_v4.Event, None]:
+        """Stream a tool-call node, emitting tool result/error events."""
         async with node.stream(run_ctx) as handle_stream:
             async for event in handle_stream:
                 await self._agent_stop_streaming()
@@ -1156,15 +1549,13 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
                     if isinstance(event.part, ToolReturnPart):
                         if event.part.metadata and (sources := event.part.metadata.get("sources")):
                             for source_url in sources:
-                                url_source = LanguageModelV1Source(
-                                    sourceType="url",
-                                    id=str(uuid.uuid4()),
-                                    url=source_url,
-                                    providerMetadata={},
+                                source_id = str(uuid.uuid4())
+                                state.ui_sources.append(
+                                    SourceUrlUIPart(
+                                        type="source-url", sourceId=source_id, url=source_url
+                                    )
                                 )
-                                _new_source_ui = SourceUIPart(type="source", source=url_source)
-                                state.ui_sources.append(_new_source_ui)
-                                yield events_v4.SourcePart(**_new_source_ui.source.model_dump())
+                                yield events_v4.SourcePart(id=source_id, url=source_url)
                         yield events_v4.ToolResultPart(
                             tool_call_id=event.tool_call_id, result=event.part.content
                         )
@@ -1180,17 +1571,14 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
                             dataclasses.asdict(event.part),
                         )
 
-    def _handle_end_node(self, node, langfuse, state: StreamingState) -> events_v4.StartStepPart:
+    def _handle_end_node(self, node, state: StreamingState) -> None:
         """Handle end node - set message ID."""
         logger.debug("End node: %s", dataclasses.asdict(node))
         if state.model_response_message_id:
             logger.error("_model_response_message_id already set")
-        state.model_response_message_id = (
-            str(uuid.uuid4())
-            if not self._langfuse_available
-            else f"trace-{langfuse.get_current_trace_id()}"
-        )
-        return events_v4.StartStepPart(message_id=state.model_response_message_id)
+        # Minted (and streamed) by _stream_content: the persisted message must
+        # carry the same id the client already assigned to the live one.
+        state.model_response_message_id = self._model_response_message_id
 
     async def _generate_title_if_needed(self) -> str | None:
         """Generate and set title if auto-title conditions are met."""
@@ -1248,6 +1636,10 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         # conversation's cumulative total.
         request_tokens = int(usage["promptTokens"]) + int(usage["completionTokens"])
 
+        # Per-message CO2 impact, captured before _prepare_update_conversation
+        # folds the conversation's cumulative total into usage["co2_impact"].
+        message_co2_impact = usage["co2_impact"]
+
         await sync_to_async(self._prepare_update_conversation)(
             final_output=new_messages,
             usage=usage,
@@ -1277,6 +1669,11 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
                 ]
             )
         self._update_langfuse_trace(run_output)
+        # Stream the CO2 annotation _prepare_update_conversation persists, so the
+        # live message carries it like a reload does. Only that key is stored:
+        # the usage in the finish frame below is streamed but never persisted.
+        if message_co2_impact:
+            yield events_v4.MessageAnnotationPart(annotations=[{"co2_impact": message_co2_impact}])
         # Vercel finish message
         yield events_v4.FinishMessagePart(
             finish_reason=events_v4.FinishReason.STOP,
@@ -1296,10 +1693,6 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         if not messages or messages[-1].role != "user":
             return
 
-        # Trace-level attributes are propagated by `_stream_content` via
-        # `propagate_attributes`; `langfuse` is kept for downstream helpers.
-        langfuse = get_client() if self._langfuse_available else None
-
         (
             user_prompt,
             input_images,
@@ -1310,9 +1703,9 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
             conversation_has_own_documents,
         ) = await self._prepare_agent_run(messages)
 
-        history, was_trimmed = apply_sliding_window(
-            history, resolve_conversation_budget(self.conversation_agent.configuration)
-        )
+        for pre_event in self._pre_stream_events:
+            yield events_v4.DataPart(data=[pre_event])
+        self._pre_stream_events = []
 
         # Re-index (or report busy) when the conversation has READY attachments and
         # its index is not current. INDEXING is included: reindex_conversation handles
@@ -1330,7 +1723,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         if is_conversation_deindexed:
             listing = await self._build_documents_listing()
             in_context_ids = (
-                {doc.document_id for doc in listing.documents if doc.access == "full-context"}
+                {doc.document_id for doc in listing.documents if doc.access == ACCESS_FULL_CONTEXT}
                 if listing
                 else set()
             )
@@ -1355,13 +1748,20 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         if doc_result is None or not doc_result.success:
             return
 
-        if was_trimmed:
-            yield events_v4.DataPart(data=[{"type": "context_trimmed"}])
-
         conversation_has_own_documents = doc_result.has_documents
+
+        # The budget check runs on `history` (stored previous turns) only; the incoming
+        # user message is not counted, by design — a turn tipped over by it alone is caught
+        # next turn, and the security buffer absorbs the overflow meanwhile (see ADR 0002).
+        async for item in self._run_history_summary_phase(history):
+            if isinstance(item, PreparedHistory):
+                history = item.history
+            else:
+                yield item
 
         await self._agent_stop_streaming(force_cache_check=True)
         self._setup_self_documentation_tool()
+        self._setup_presentation_tool()
         self._setup_web_search_tool()
         self._setup_web_search(force_web_search)
 
@@ -1377,15 +1777,17 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
             if history and history[-1].kind == "request":
                 if history[-1].parts and history[-1].parts[-1].part_kind == "tool-return":
                     history.append(ModelResponse(parts=[TextPart(content="ok")], kind="response"))
+            message_history = history if history else None
 
             async with self.conversation_agent.iter(
                 [user_prompt] + input_images,
-                message_history=history,  # history will pass through agent's history_processors
+                # History passes through the ProcessHistory capability set on the agent.
+                message_history=message_history,
                 deps=self._context_deps,
                 toolsets=mcp_servers,
             ) as run:
                 state = StreamingState()
-                async for event in self._process_agent_nodes(run, state, langfuse):
+                async for event in self._process_agent_nodes(run, state):
                     yield event
 
                 # Extract values from run before exiting the context manager
@@ -1438,7 +1840,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         *,
         final_output: List[ModelRequest | ModelMessage],
         usage: Dict[str, Union[int, float]],
-        ui_sources: Optional[List[SourceUIPart]] = None,
+        ui_sources: Optional[List[SourceUrlUIPart]] = None,
         model_response_message_id: str | None = None,
         image_actions: Optional[ImagePostRunActions] = None,
     ):  # pylint: disable=too-many-arguments
@@ -1453,7 +1855,7 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
             usage (Dict[str, Union[int, float]]): Token and CO2 usage statistics
             (mutated in-place to accumulate across turns).
             model_response_message_id (str | None): Message ID
-            ui_sources (List[SourceUIPart]): Optional UI sources to include in the conversation.
+            ui_sources (List[SourceUrlUIPart]): Optional UI sources to include.
             image_actions (ImagePostRunActions | None): Per-turn image-URL
             surgery to apply before persistence (rewrite presigned URLs back
             to durable form for in-message images, drop pinned project
@@ -1484,9 +1886,10 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
 
         co2_impact = usage["co2_impact"]
         if co2_impact:
-            if _output_ui_message.annotations is None:
-                _output_ui_message.annotations = []
-            _output_ui_message.annotations.append({"co2_impact": co2_impact})
+            _output_ui_message.metadata = {
+                **(_output_ui_message.metadata or {}),
+                "co2_impact": co2_impact,
+            }
 
         usage["co2_impact"] += self.conversation.agent_usage.get("co2_impact", 0)
         usage["promptTokens"] += self.conversation.agent_usage.get("promptTokens", 0)
@@ -1495,9 +1898,11 @@ class AIAgentService:  # pylint: disable=too-many-instance-attributes
         self.conversation.agent_usage = usage
 
         if not (self.conversation.messages and self.conversation.messages[-1].role == "user"):
-            self.conversation.messages += [
-                model_message_to_ui_message(_merged_final_output_request)
-            ]
+            _request_ui_message = model_message_to_ui_message(_merged_final_output_request)
+            # None when the request holds nothing renderable (system prompt or
+            # tool return only): there is no user bubble to rebuild.
+            if _request_ui_message:
+                self.conversation.messages += [_request_ui_message]
         self.conversation.messages += [_output_ui_message]
 
         final_output_json = json.loads(

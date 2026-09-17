@@ -9,16 +9,18 @@ from urllib.parse import urljoin
 
 from django.conf import settings
 
-import requests
+import httpx
 from pypdf import PdfReader, PdfWriter
 
+from chat.agent_rag.document_converter.guards import guard_pdf_page_count, guard_zip_bomb
 from chat.agent_rag.document_converter.markitdown import DocumentConverter
+from chat.constants import PDF_MIME_TYPE
 
 from .odt import OdtToMd
 
 logger = logging.getLogger(__name__)
 
-CT_PDF = "application/pdf"
+CT_PDF = PDF_MIME_TYPE
 CT_ODT = "application/vnd.oasis.opendocument.text"
 
 
@@ -33,6 +35,7 @@ class BaseParser(ABC):
 
     def parse_document(self, name: str, content_type: str, content: bytes) -> str:
         """Route to the appropriate parser based on content type."""
+        guard_zip_bomb(content)
         content_type = content_type.lower()
         if content_type == CT_PDF:
             return self.parse_pdf_document(name=name, content_type=content_type, content=content)
@@ -60,28 +63,35 @@ class OdtParserMixin:
 
 
 class AlbertParser(OdtParserMixin, BaseParser):
-    """Document parser using Albert API for PDFs."""
+    """Document parser using Albert API for PDFs.
 
-    endpoint = urljoin(settings.ALBERT_API_URL, "/v1/parse-beta")
+    Sends every PDF to Albert's OCR endpoint, with no local analysis. Use
+    AdaptivePdfParser instead to keep text-based PDFs out of OCR.
+    """
+
+    endpoint = urljoin(settings.ALBERT_API_URL, "/v1/ocr")
 
     def parse_pdf_document(self, name: str, content_type: str, content: bytes) -> str:
         """Parse PDF document using Albert API."""
-        response = requests.post(
+        file_data = base64.standard_b64encode(content).decode("utf-8")
+        response = httpx.post(
             self.endpoint,
             headers={
                 "Authorization": f"Bearer {settings.ALBERT_API_KEY}",
             },
-            files={
-                "file": (name, content, content_type),
-                "output_format": (None, "markdown"),
+            json={
+                "document": {
+                    "type": "document_url",
+                    "document_name": name,
+                    "document_url": f"data:{content_type};base64,{file_data}",
+                },
+                "model": settings.OCR_MODEL,
             },
             timeout=settings.ALBERT_API_PARSE_TIMEOUT,
         )
         response.raise_for_status()
 
-        return "\n\n".join(
-            document_page["content"] for document_page in response.json().get("data", [])
-        )
+        return "\n\n".join(page.get("markdown", "") for page in response.json().get("pages", []))
 
 
 METHOD_TEXT_EXTRACTION = "text_extraction"
@@ -92,6 +102,7 @@ def analyze_pdf(pdf_data: bytes) -> dict:
     """Analyze a PDF to determine if it needs OCR or can use direct text extraction."""
     reader = PdfReader(BytesIO(pdf_data))
     total_pages = len(reader.pages)
+    guard_pdf_page_count(total_pages)
     if total_pages == 0:
         logger.info("No page found in pdf")
         return {
@@ -221,7 +232,7 @@ class AdaptivePdfParser(AdaptivePdfParserMixin, OdtParserMixin, BaseParser):
         last_exception = None
         for attempt in range(self.max_retries):
             try:
-                response = requests.post(
+                response = httpx.post(
                     self.endpoint,
                     headers=self.headers,
                     json=payload,
@@ -232,7 +243,7 @@ class AdaptivePdfParser(AdaptivePdfParserMixin, OdtParserMixin, BaseParser):
                 pages = response.json().get("pages", [])
                 return [page.get("markdown", "") for page in pages]
 
-            except (requests.Timeout, requests.RequestException) as e:
+            except httpx.HTTPError as e:
                 last_exception = e
                 if attempt < self.max_retries - 1:
                     logger.warning(
@@ -276,5 +287,4 @@ class AdaptivePdfParser(AdaptivePdfParserMixin, OdtParserMixin, BaseParser):
             except Exception as e:  # pylint: disable=broad-except #noqa: BLE001
                 logger.error("Failed to OCR pages %d-%d: %s", start_index + 1, end_index, str(e))
                 results.extend([""] * (end_index - start_index))
-
         return "\n\n".join(results)

@@ -29,7 +29,6 @@ Both share the same model, same storage, same RAG backend, and the same retrieva
   - [Image Attachments](#image-attachments)
   - [PDF Documents](#pdf-documents)
   - [Other Document Types](#other-document-types)
-  - [Find backend: known limitations](#find-backend-known-limitations)
 - [Configuration](#configuration)
 
 ---
@@ -217,14 +216,29 @@ Project attachments live on `ChatProject` rather than on a single `ChatConversat
 
 ### Indexing at upload time
 
+> For the full indexing lifecycle - the `index_state` state machine, the automatic transient retry, the user-initiated retry, failure logging, and the frontend UX - see the dedicated [Project File Indexing](project-file-indexing.md) doc. This section is the storage-oriented summary.
+
 Conversation attachments are indexed lazily when a chat turn first builds RAG context. Project attachments cannot follow that pattern - any conversation in the project may be the first to ask about a file, and we want them searchable immediately.
 
-The malware safe callback for projects (`chat.malware_detection.project_safe_attachment_callback`) does two things in sequence after marking the attachment `READY`:
+The malware safe callback for projects (`chat.malware_detection.project_safe_attachment_callback`), after marking the attachment `READY`:
 
-1. Fetches the attachment with `select_related("project", "uploaded_by")`.
-2. Calls `chat.agent_rag.indexing.index_project_attachment(attachment)`.
+1. Marks indexable files `index_state = INDEXING` immediately, before the worker picks the task up. This closes the brief enqueue window in which a message sent right after upload could see the file as not-yet-indexing and answer without its content (the send gate keys off `INDEXING`).
+2. Enqueues the Celery task `chat.tasks.index_project_attachment_task` with the attachment id. The heavy parse/store work runs **off the request/callback path, on a worker** (`celery-dev` in development).
 
-`index_project_attachment` is a one-shot, idempotent indexer: it skips images, skips markdown companion rows (`conversion_from` set), skips attachments already carrying a `rag_document_id`, parses the file via `RAG_DOCUMENT_PARSER`, and stores the result in the project's RAG collection. Failures are logged and swallowed - the file stays `READY` and downloadable but won't surface in RAG search until a future re-index.
+The task resolves the row with `select_related("project", "uploaded_by")` and delegates to `chat.agent_rag.indexing.index_project_attachment`, a one-shot, idempotent indexer: it skips images, skips markdown companion rows (`conversion_from` set), skips attachments already carrying a `rag_document_id`, parses the file via `RAG_DOCUMENT_PARSER`, and stores the result in the project's RAG collection. It records its own outcome on the row (`index_state` NOT_INDEXED → INDEXING → INDEXED / FAILED, with `processing_error` on failure). Failures are logged and never raised - the file stays `READY` and downloadable; it just won't surface in RAG search until a future re-index.
+
+#### Worker resource limits
+
+Parsing untrusted uploads (PDF, DOCX, ODT, ...) is the riskiest in-process work in the app: a malformed or hostile file can make the parser loop, hang, or balloon memory (zip bombs, XML entity expansion). Running it on a Celery worker instead of in the web process lets us bound it with two task time limits - this is the main reason the parse moved onto a worker, not just to get it off the request path.
+
+| Setting | Default | What fires | Effect |
+|---|---|---|---|
+| `CELERY_TASK_SOFT_TIME_LIMIT` | 180s (3 min) | Celery raises `SoftTimeLimitExceeded` **inside the task**, at the current line | A normal Python exception. It propagates to the `except Exception` in `index_project_attachment`, which records `index_state = FAILED` + `processing_error`. The worker stays alive; the over-slow file ends as a clean, visible failure that can be re-indexed later. |
+| `CELERY_TASK_TIME_LIMIT` | 300s (5 min) | Celery **SIGKILLs the worker child process** running the task | The hard backstop for the case the soft limit can't reach (a parse wedged in a C extension that never yields, or growing memory without pause). Killing the OS process is the only thing that reliably reclaims its memory; Celery then spins up a fresh child. |
+
+The two work together: the soft limit (graceful, catchable, leaves a recorded failure) is the path you want to hit; the hard limit (unconditional kill ~120s later) is the guarantee that no single upload can pin a worker or OOM the box. Keep `hard > soft` if you override either.
+
+Caveats: the hard kill needs the **prefork** pool (the worker command uses it by default); it does nothing on the `solo` pool. Eager mode (`CELERY_TASK_ALWAYS_EAGER`, used in tests) runs tasks inline and ignores both limits. These limits bound CPU time and memory of a runaway parse; they are **not** the blast-radius fix for a parser RCE - the worker still loads the full secret set today, so narrowing the worker's secrets/egress remains separate follow-up work.
 
 ### Project RAG collection
 
@@ -234,7 +248,7 @@ collection_id` starts NULL; `_ensure_project_collection(project)` runs the creat
 
 At search time, when a conversation belongs to a project, the project's collection is added to the search payload alongside the conversation's own collection (`read_only_collection_id=[project.collection_id]`). The model can therefore pull chunks from both scopes in a single tool call.
 
-The Albert backend records a per-document id (`rag_document_id`) at index time. The search tool prefers it over name-based filtering (`document_ids: [<int>]` instead of `metadata_filters: document_name`) - this is collection-aware and unambiguous, whereas a name match could collide across the conversation and project collections. The Find backend currently does not return per-document ids; both id-based and name-based filters fall back to a plain query.
+The Albert backend records a per-document id (`rag_document_id`) at index time. The search tool prefers it over name-based filtering (`document_ids: [<int>]` instead of `metadata_filters: document_name`) - this is collection-aware and unambiguous, whereas a name match could collide across the conversation and project collections.
 
 ### Markdown companion attachment
 
@@ -431,10 +445,10 @@ When a user sends a message with attachments, the system processes them differen
 
 1. **Document parsing**: Two pluggable settings drive parsing and storage:
    - `RAG_DOCUMENT_PARSER` (default `chat.agent_rag.document_converter.parser.AlbertParser`): converts the source bytes to Markdown. Routes by content type - ODT files always use `odfdo`, everything other than PDF/ODT goes through **MarkItDown**, PDFs depend on which parser is configured (see below).
-   - `RAG_DOCUMENT_SEARCH_BACKEND` (`AlbertRagBackend` or `FindRagBackend`): stores the converted markdown in the configured vector index and serves search queries.
+   - `RAG_DOCUMENT_SEARCH_BACKEND` (default `chat.agent_rag.document_rag_backends.albert_rag_backend.AlbertRagBackend`): stores the converted markdown in the configured vector index and serves search queries.
 
    **PDF parsing strategies** (per `RAG_DOCUMENT_PARSER`):
-   - `AlbertParser`: every PDF is sent unconditionally to the Albert `/v1/parse-beta` endpoint.
+   - `AlbertParser`: every PDF is sent unconditionally to the Albert `/v1/ocr` endpoint (as a base64 data URL, using `OCR_MODEL`). No local analysis, so text-based PDFs go through OCR too.
    - `AdaptivePdfParser`: runs a `pypdf`-based heuristic on the upload first (see `analyze_pdf` in `parser.py`):
      - Counts pages with extractable text and the average characters per page.
      - If `avg_chars_per_page > MIN_AVG_CHARS_FOR_TEXT_EXTRACTION` AND `text_coverage > MIN_TEXT_COVERAGE_FOR_TEXT_EXTRACTION`, the PDF is treated as a born-digital text PDF and converted **locally** via MarkItDown - no external API call.
@@ -449,7 +463,7 @@ When a user sends a message with attachments, the system processes them differen
    - **`tool_call_only`**: oversized or evicted conversation documents, **and every project document**, stay reachable via the `document_search_rag` tool, plus `summarize` for conversation files or `summarize_project` for project-library files.
 
 4. **RAG (Retrieval-Augmented Generation)**:
-   - Converted text is indexed in a vector database (Albert collection or Find index). Conversations and projects each have their own collection.
+   - Converted text is indexed in a vector database (Albert collection). Conversations and projects each have their own collection.
    - The LLM uses the `document_search_rag` tool to query relevant chunks. When the conversation belongs to a project, both the conversation collection and the project collection are searched in a single call. The tool accepts an optional `document_id` argument to target a single attachment from either scope.
 
 5. **Summarization tool** if needed (also accepts `document_id`).
@@ -502,11 +516,12 @@ Notes:
 
 The decision of which documents are inlined as `full-context` vs left as `tool_call_only` is made by `chat/document_context_builder.py:build_documents_listing` on each turn (called via `_build_document_context_instruction` in `chat/clients/pydantic_ai.py`):
 
-1. Compute the `document_budget` in tokens:
+1. Compute budgets in tokens (`chat/tokens.py` splits `max_token_context` by ratio, then subtracts the security buffer from **each** share independently):
    ```text
-   document_budget = max(int(model.max_token_context * DOCUMENT_CONTEXT_BUDGET_RATIO)
-                         - DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS, 0)
+   document_budget      = max(int(max_token_context * DOCUMENT_CONTEXT_BUDGET_RATIO) - DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS, 0)
+   message_token_budget = max(int(max_token_context * (1 - DOCUMENT_CONTEXT_BUDGET_RATIO)) - DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS, 0)
    ```
+   The document share (`document_budget`, via `compute_document_budget`) inlines conversation documents; the history share (`message_token_budget`, via `compute_conversation_budget`) is the conversation-summarization trigger. `build_documents_listing` receives the raw `max_token_context`, `budget_ratio`, and `security_buffer_tokens` and applies the formula above.
 2. Load all text attachments from object storage **in parallel** (`asyncio.gather`). Attachments that fail to load are marked `tool_call_only` with their failure logged; other documents are not affected.
 3. Iterate documents oldest-first (`order_by("created_at", "id")`). For each document:
    - If its token count exceeds the whole budget alone → keep `tool_call_only`.
@@ -520,6 +535,18 @@ Token estimation uses `tiktoken` with the `cl100k_base` encoding (GPT-4 tokenize
 
 The assembled listing is **cached** per turn (in `_build_documents_listing`, `pydantic_ai.py`) keyed on:
 `conversation_id`, `user_id`, `model_hrid`, `model.max_token_context`, `DOCUMENT_CONTEXT_BUDGET_RATIO`, `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS`, and a fingerprint of `(attachment.id, attachment.updated_at)` for every text attachment — **conversation and project text attachments both contribute to the fingerprint**. Any attachment add / remove / edit (including project files), or any settings change, invalidates the cache. TTL is 30 minutes (`CACHE_TIMEOUT`).
+
+#### Conversation history summarization
+
+When `message_token_budget` is exceeded, `chat/agents/history_processors.py` calls a separate summarization model (`LLM_SUMMARIZATION_MODEL_HRID`) and stores the result on the conversation (`history_summary`, `history_summary_checkpoint`). This runs at the **start of a new user turn**, before `agent.iter`, against **stored** `pydantic_messages` from previous turns only (the current user prompt is extracted separately and, by design, is not counted in the budget check — see ADR 0002). That stored history usually ends on an assistant `ModelResponse`.
+
+1. **Trigger**: estimated tokens in the active history slice exceed `message_token_budget` (see formulas above) and there are new messages after the last checkpoint.
+2. **After a summary**: the model receives the stored summary text (dynamic instruction) plus roughly the last `CONVERSATION_SUMMARY_CONTEXT_MESSAGES` `ModelMessage` entries before the checkpoint. Use an **even** value so the retained window starts on a user `ModelRequest` in a plain user/assistant alternation (tool messages can break parity). The count is a target, not a strict ceiling: the window start is aligned back to the nearest user message, which can retain up to one complete turn more, and that retained tail is then trimmed turn by turn whenever it would push the window past `message_token_budget`, so one oversized entry cannot pin the window above budget (see [history-processor.md](history-processor.md)). Messages *after* the checkpoint are never dropped, since no summary covers them yet.
+3. **Summary length**: capped by `CONVERSATION_SUMMARY_MAX_TOKENS` on the summarization LLM call.
+4. **Disable summarization**: zero the `message_token_budget`, by setting `max_token_context=0` on the chat model in `LLM_CONFIGURATIONS`, `DOCUMENT_CONTEXT_BUDGET_RATIO=1` (reallocates the whole context to the document share), or a `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS` large enough to consume the history share. Note: *omitting* `max_token_context` does **not** disable summarization — unlike document inlining, `resolve_conversation_budget` falls back to `DEFAULT_MAX_TOKEN_CONTEXT`, so the history budget stays non-zero.
+5. **Visible blocking generation**: at the start of a turn whose active history (previous turns only; the new user message is not counted — see ADR 0002) exceeds the history budget, the turn enqueues a Celery task (`chat/tasks.py:summarize_conversation_history`) and waits for it on the open SSE stream, emitting `keep_alive` data parts; the client shows an in-thread progress indicator anchored on the `summarize` tool events. Concurrency is controlled by a time-bounded claim (`ChatConversation.history_summary_claimed_at`, TTL = task hard time limit 120s + 60s): if the task never claims within a 10s grace window or its claim dies and no summary has landed, the turn fails with a `summarization_failed` stream error — there is no inline fallback; generation stays Celery-only (3 task retries with exponential backoff). A turn is never answered with truncated context, and never with over-budget context that a summary could have fixed — see `docs/adr/0002-summarization-visible-blocking-phase.md` and ADR 0001. The exception is a single message larger than the budget on its own: nothing summarizes it yet, so the turn it arrives on is sent over budget, and it is folded into the summary for the turns after.
+
+The security buffer is **not** a dedicated reserve for system prompts, tool schemas, or completion tokens; those are added on top of the planned document/history split. Size the buffer (and/or plan `max_token_context` below the model nominal window) to leave headroom for that overhead.
 
 #### Targeted document operations (`document_id`)
 
@@ -536,33 +563,13 @@ For all three tools, the resolution is:
 2. Look it up against the tool-specific attachment set (see table). **If the UUID is not in that set, the tool raises `ModelRetry` ("not found")** - this is the IDOR boundary. The boundaries are deliberately strict per-tool: `summarize` rejects a project-attachment id (the LLM should call `summarize_project` instead), `summarize_project` rejects a conversation-attachment id, and `document_search_rag` is the only widening tool because the model cannot tell from the question alone which scope to prefer.
 3. For `document_search_rag`, forward the resolved attachment to the backend, preferring the per-document id (`rag_document_id`) recorded at index time over the file name:
    - **Albert**: sends `document_ids: [<int>]` on `/v1/search`. This is collection-aware and unambiguous, which matters when conversation and project collections both carry a file with the same name.
-   - **Find**: per-document id is not available; the backend currently ignores both `document_id` and `document_name` filters and runs a plain query (known gap, follow-up work).
-   - When `rag_document_id` is missing (e.g. older attachment, Find backend), Albert falls back to a `metadata_filters: { key: "document_name", value: ..., type: "eq" }` clause; the file name is `report.pdf.md` stripped to `report.pdf` if the attachment is a converted markdown copy.
+   - When `rag_document_id` is missing (e.g. an older attachment indexed before the id was recorded), Albert falls back to a `metadata_filters: { key: "document_name", value: ..., type: "eq" }` clause; the file name is `report.pdf.md` stripped to `report.pdf` if the attachment is a converted markdown copy.
 
 The two `summarize*` tools share the same chunk-and-merge pipeline (`_summarize_text_attachments` in `chat/tools/document_summarize.py`) - they only differ in which attachment set they fetch and which scope-specific soft-fail message they emit ("no docs in this conversation" vs. "no project files").
 
 #### Empty filtered RAG result → `ModelRetry`
 
 If the model targeted a document via `document_id` and the backend returned no results, `document_search_rag` raises `ModelRetry` with explicit guidance: either retry without `document_id` (and explicitly tell the user the search was broadened) or stop and tell the user the targeted document does not contain the requested information. This replaces an earlier silent fallback that quietly widened scope without informing the model. See `chat/tools/document_search_rag.py` for the exact text.
-
-#### Find backend: known limitations
-
-`FindRagBackend` does not have feature parity with `AlbertRagBackend`. Operators selecting `RAG_DOCUMENT_SEARCH_BACKEND` should account for the following gaps:
-
-| Capability | Albert | Find |
-|---|---|---|
-| Per-document id captured at index time (`rag_document_id`) | ✅ | ❌ |
-| Per-attachment delete (`DELETE /v1/documents/{id}`) | ✅ removes chunks immediately | ❌ no-op; chunks remain searchable until the parent conversation/project is deleted and the whole collection is dropped |
-| `document_id`-targeted RAG search | ✅ filtered to one document | ❌ raises `FindFilterUnsupportedError` instead of silently returning full-collection hits |
-| `document_name`-targeted fallback | ✅ `metadata_filters` clause | ❌ raises `FindFilterUnsupportedError` |
-| RAG enable-gate (`_check_should_enable_rag`) | ✅ fires once any attachment has `rag_document_id` set | ❌ never fires - Find never populates `rag_document_id`, so the agent runs without RAG tools registered |
-
-User-visible consequences when running Find:
-- Deleting a sensitive attachment from a project does **not** remove its chunks from the search index. They keep surfacing in RAG searches until the project itself is deleted.
-- A `document_id`-targeted search fails fast with `FindFilterUnsupportedError` rather than silently returning unrelated hits. Callers (e.g. the `document_search_rag` tool) need to catch this and surface a clear "this backend cannot scope to one document; retry without document_id or switch backend" message.
-- **The agent does not register any RAG tools.** Because the enable-gate uses `rag_document_id` as the "actually indexed" signal and Find never sets it, even successful Find indexing is invisible to the gate. The model answers from training data alone unless documents arrive in the current message. Selecting Find is therefore a deliberate "no per-document features, no RAG tools" choice until per-document ids are wired in.
-
-The Albert backend is the recommended choice for any deployment that needs per-document control or RAG tooling. Wiring per-document operations into Find is a known follow-up.
 
 ### Processing Strategy Decision Tree
 
@@ -577,7 +584,7 @@ The RAG-tool gate (`AIAgentService._check_should_enable_rag`) keys off `rag_docu
 - the conversation owns at least one attachment with a non-empty `rag_document_id`,
 - the conversation belongs to a project that owns at least one such attachment.
 
-A `READY` attachment whose `rag_document_id` is null (e.g. parse succeeded but the backend store call failed, or the backend simply never returns ids) does not trip the gate. This is why the Find backend - which never returns a per-document id - leaves RAG disabled even when its index call succeeds, as called out in the Find section above.
+A `READY` attachment whose `rag_document_id` is null (e.g. parse succeeded but the backend store call failed) does not trip the gate.
 
 ---
 
@@ -596,11 +603,14 @@ A `READY` attachment whose `rag_document_id` is null (e.g. parse succeeded but t
 | `MALWARE_DETECTION_PARAMETERS`               | `{}`           | Backend-specific configuration                             |
 | `RAG_FILES_ACCEPTED_FORMATS`                 | See below      | List of MIME types accepted for file uploads               |
 | `RAG_DOCUMENT_PARSER`                        | `AlbertParser` | Import path of the parser that converts uploads to Markdown (PDF -> Albert API, ODT -> odfdo, others -> MarkItDown) |
-| `RAG_DOCUMENT_SEARCH_BACKEND`                | `AlbertRagBackend` | Import path of the vector-search backend used for indexing and search (Albert or Find) |
+| `RAG_DOCUMENT_SEARCH_BACKEND`                | `AlbertRagBackend` | Import path of the vector-search backend used for indexing and search |
 | `PROJECT_FILES_MAX_COUNT`                    | `10`           | Max non-image attachments per project (excludes hidden markdown companions). Enforced at upload-time in `ChatProjectAttachmentViewSet`. Bounds per-turn system-prompt token cost (every entry contributes to `project_documents` on every conversation turn). |
 | `PROJECT_IMAGES_MAX_COUNT`                   | `3`            | Max image attachments per project. Enforced at upload-time. Bounds per-turn vision token cost - every project image is pinned to every turn alongside conversation-message images, and provider request-level image caps (Anthropic ~20/request) clip the trailing entries first. |
-| `DOCUMENT_CONTEXT_BUDGET_RATIO`              | `0.5`          | Fraction of `model.max_token_context` reserved for inlined documents (0 disables full-context inlining; everything stays `tool_call_only`) |
-| `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS`    | `1000`         | Tokens subtracted from the inlining budget to absorb tokenizer drift on non-OpenAI models |
+| `DOCUMENT_CONTEXT_BUDGET_RATIO`              | `0.5`          | Fraction of `model.max_token_context` reserved for inlined documents; `(1 - ratio)` goes to the conversation history budget (summarization trigger). The security buffer is subtracted from each share afterwards. `0` disables full-context inlining (everything stays `tool_call_only`). |
+| `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS`    | `1000`         | Tokens subtracted from **each** of the document and history budgets (independently), to absorb tokenizer drift on non-OpenAI models and leave headroom beyond the planned split |
+| `CONVERSATION_SUMMARY_CONTEXT_MESSAGES`      | `10`           | Target pydantic-ai `ModelMessage` entries kept in runtime history after a conversation summary (in addition to the stored summary text). A target, not a strict ceiling: up to one complete turn more is kept when the window is aligned back to a user message, and fewer when they would not fit the history budget. Use an even value (see [Conversation history summarization](#conversation-history-summarization)) |
+| `CONVERSATION_SUMMARY_MAX_TOKENS`            | `2048`         | `max_tokens` for the summarization LLM call when generating or updating `history_summary` |
+| `LLM_SUMMARIZATION_MODEL_HRID`               | `default-summarization-model` | HRID in `LLM_CONFIGURATIONS` for the conversation summarization agent (see [LLM Configuration](llm-configuration.md)) |
 | `RAG_COLLECTION_INACTIVITY_DAYS`             | `30`           | Conversations inactive for this many days have their RAG collection de-indexed by `deindex_inactive_collections`. Resets on re-index. |
 
 #### RAG_FILES_ACCEPTED_FORMATS
@@ -649,7 +659,7 @@ RAG_FILES_ACCEPTED_FORMATS = [
 
 ### Per-model setting: `max_token_context`
 
-Each entry in `LLM_CONFIGURATIONS` accepts a `max_token_context` integer field declaring the model's context window size. When set, it drives the inlining budget for the documents listing (`document_budget = max_token_context * DOCUMENT_CONTEXT_BUDGET_RATIO - DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS`).
+Each entry in `LLM_CONFIGURATIONS` accepts a `max_token_context` integer field declaring the model's context window size. When set, it drives document inlining and conversation summarization budgets: `max_token_context` is split by `DOCUMENT_CONTEXT_BUDGET_RATIO`, and `DOCUMENT_CONTEXT_SECURITY_BUFFER_TOKENS` is subtracted from **each** share independently (see the formulas under [Inlining policy and FIFO eviction](#inlining-policy-and-fifo-eviction)).
 
 If a model has no `max_token_context`, all of its documents are kept `tool_call_only` regardless of size and a warning is logged on every chat turn. Setting the field accurately matters: too low and small documents get pushed to RAG-only when they could be inlined; too high and the LLM may exceed its real window.
 
